@@ -44,6 +44,12 @@ from PIL import Image, ImageEnhance, ImageOps
 import mido
 import pygame
 
+try:
+    from tvstore_receipt import print_receipt as _escpos_print_receipt
+    _ESCPOS_AVAILABLE = True
+except Exception:
+    _ESCPOS_AVAILABLE = False
+
 
 APP_NAME = "PiPhotobooth"
 
@@ -805,6 +811,13 @@ class PrintManager:
 
     def print_or_queue(self, photo_path: Path) -> Tuple[bool, str]:
         PRINT_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+        if _ESCPOS_AVAILABLE:
+            try:
+                _escpos_print_receipt(str(photo_path))
+                return True, "Printed via ESC/POS"
+            except Exception as exc:
+                logging.warning("ESC/POS print failed (%s); falling back to CUPS/queue", exc)
 
         if self.can_print_cups():
             try:
