@@ -1,0 +1,1 @@
+/home/pi/photobooth/.venv/bin/python -u photobooth.py

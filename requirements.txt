@@ -1,0 +1,8 @@
+mido==1.3.2
+python-rtmidi==1.5.8
+pygame==2.6.0
+Pillow==10.4.0
+numpy==2.0.1
+
+# Optional fallback for USB webcams (recommended to install via apt on Pi for speed/compat):
+# opencv-python==4.10.0.84

@@ -1,0 +1,19 @@
+[Unit]
+Description=Raspberry Pi Photobooth (pygame + MIDI)
+After=network.target graphical.target sound.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/photobooth
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/pi/photobooth/photobooth.py
+Restart=always
+RestartSec=2
+
+# If you run headless with an X session, you might need:
+# Environment=DISPLAY=:0
+# Environment=XAUTHORITY=/home/pi/.Xauthority
+
+[Install]
+WantedBy=graphical.target
