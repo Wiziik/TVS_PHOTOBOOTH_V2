@@ -1,19 +1,16 @@
 [Unit]
-Description=Raspberry Pi Photobooth (pygame + MIDI)
-After=network.target graphical.target sound.target
+Description=TVS Photobooth
+After=multi-user.target sound.target
 
 [Service]
 Type=simple
 User=pi
-WorkingDirectory=/home/pi/photobooth
+WorkingDirectory=/home/pi/TVS_PHOTOBOOTH_V2
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/pi/photobooth/photobooth.py
+Environment=DISPLAY=:0
+ExecStart=/home/pi/TVS_PHOTOBOOTH_V2/venv/bin/python3 /home/pi/TVS_PHOTOBOOTH_V2/photobooth.py
 Restart=always
-RestartSec=2
-
-# If you run headless with an X session, you might need:
-# Environment=DISPLAY=:0
-# Environment=XAUTHORITY=/home/pi/.Xauthority
+RestartSec=3
 
 [Install]
-WantedBy=graphical.target
+WantedBy=multi-user.target
