@@ -45,7 +45,12 @@ try:
     logging.getLogger(__name__).debug("tvstore_receipt imported OK")
 except Exception as _e:
     logging.getLogger(__name__).warning("tvstore_receipt import failed: %s", _e)
-    def print_receipt(photo_path: str, frame_id: str | None = None) -> None:  # type: ignore[misc]
+    def print_receipt(
+        photo_path: str,
+        frame_id: str | None = None,
+        reduce_factor: float = 1.0,
+        qr_url: str | None = None,
+    ) -> None:  # type: ignore[misc]
         raise RuntimeError(f"tvstore_receipt not available: {_e}")
 
 
@@ -266,6 +271,8 @@ class AppConfig:
     filter_cycle:           Tuple[str,...] = ("none", "bw", "retro")
     default_filter:         str            = "none"
     copies:                 int            = 1
+    image_reduce_factor:    float          = 1.0
+    qr_url:                 str            = ""
     minimal_ui:             bool           = True
     countdown_wav:          str            = "./countdown.wav"
     shutter_wav:            str            = "./shutter.wav"
@@ -315,6 +322,10 @@ countdown_cc = 2
 
 [printer]
 copies = 1
+; 1.0 = full print width, 0.8 = 20% narrower (less print data)
+image_reduce_factor = 1.0
+; QR URL override from INI. Leave empty to use receipt_text.txt QR_URL
+qr_url =
 
 [camera]
 ; -1 = auto-scan device indices until one works
@@ -378,6 +389,8 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         filter_cycle            = filter_cycle,
         default_filter          = default_filter,
         copies                  = _int(prn.get("copies"), 1),
+        image_reduce_factor     = clamp(_float(prn.get("image_reduce_factor"), 1.0), 0.1, 1.0),
+        qr_url                  = str(prn.get("qr_url", "")).strip(),
         minimal_ui              = _bool(app.get("minimal_ui"), True),
         countdown_wav           = str(app.get("countdown_wav", "./countdown.wav")).strip(),
         shutter_wav             = str(app.get("shutter_wav",   "./shutter.wav")).strip(),
@@ -673,8 +686,15 @@ def apply_filter(img: Image.Image, filter_name: str, brightness: float) -> Image
 class PrintManager:
     """Runs ESC/POS printing in a background thread so the UI never freezes."""
 
-    def __init__(self, copies: int = 1) -> None:
+    def __init__(
+        self,
+        copies: int = 1,
+        image_reduce_factor: float = 1.0,
+        qr_url: str = "",
+    ) -> None:
         self.copies   = max(1, copies)
+        self.image_reduce_factor = clamp(float(image_reduce_factor), 0.1, 1.0)
+        self.qr_url = str(qr_url).strip()
         self._lock    = threading.Lock()
         self._printing = False
 
@@ -703,7 +723,11 @@ class PrintManager:
                         f"Photo file too small ({size} B) — capture may have failed"
                     )
                 for _ in range(self.copies):
-                    print_receipt(str(photo_path))
+                    print_receipt(
+                        str(photo_path),
+                        reduce_factor=self.image_reduce_factor,
+                        qr_url=self.qr_url,
+                    )
                 msg = f"Printed {self.copies}x OK"
                 logging.info(msg)
                 if on_done:
@@ -756,7 +780,11 @@ class PhotoboothApp:
         self.midi.start()
 
         self.camera  = CameraController(cfg.camera)
-        self.printer = PrintManager(cfg.copies)
+        self.printer = PrintManager(
+            copies=cfg.copies,
+            image_reduce_factor=cfg.image_reduce_factor,
+            qr_url=cfg.qr_url,
+        )
         self._last_camera_ok = time.time()
 
         # Audio

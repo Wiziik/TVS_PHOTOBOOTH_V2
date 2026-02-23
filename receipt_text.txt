@@ -1,0 +1,11 @@
+# Edit these values to customize printed text.
+# Format: KEY = value
+# Leave QR_URL empty to disable QR code printing.
+
+BRAND_TOP = 3615 TV STORE
+BRAND_SUB = PHOTOBOOTH // ANALOG DREAMS
+FOOTER_1 = tvstore.fr
+FOOTER_2 = Merci • Keep the signal alive
+QR_URL = https://tvstore.fr
+FRAME_LABEL = FRAME
+SCAN_LABEL = SCAN / DOWNLOAD

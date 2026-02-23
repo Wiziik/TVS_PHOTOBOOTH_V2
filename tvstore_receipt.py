@@ -21,6 +21,71 @@ BRAND_SUB = "PHOTOBOOTH // ANALOG DREAMS"
 FOOTER_1 = "tvstore.fr"
 FOOTER_2 = "Merci • Keep the signal alive"
 QR_URL = "https://tvstore.fr"
+FRAME_LABEL = "FRAME"
+SCAN_LABEL = "SCAN / DOWNLOAD"
+
+RECEIPT_TEXT_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "receipt_text.txt",
+)
+
+RECEIPT_TEXT_DEFAULTS = {
+    "BRAND_TOP": BRAND_TOP,
+    "BRAND_SUB": BRAND_SUB,
+    "FOOTER_1": FOOTER_1,
+    "FOOTER_2": FOOTER_2,
+    "QR_URL": QR_URL,
+    "FRAME_LABEL": FRAME_LABEL,
+    "SCAN_LABEL": SCAN_LABEL,
+}
+
+RECEIPT_TEXT_TEMPLATE = """# Edit these values to customize printed text.
+# Format: KEY = value
+# Leave QR_URL empty to disable QR code printing.
+
+BRAND_TOP = 3615 TV STORE
+BRAND_SUB = PHOTOBOOTH // ANALOG DREAMS
+FOOTER_1 = tvstore.fr
+FOOTER_2 = Merci • Keep the signal alive
+QR_URL = https://tvstore.fr
+FRAME_LABEL = FRAME
+SCAN_LABEL = SCAN / DOWNLOAD
+"""
+
+
+def _ensure_receipt_text_file(path: str = RECEIPT_TEXT_PATH) -> None:
+    if os.path.exists(path):
+        return
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(RECEIPT_TEXT_TEMPLATE)
+        logging.info("Created default receipt text file: %s", path)
+    except Exception as e:
+        logging.warning("Could not create receipt text file %s: %s", path, e)
+
+
+def load_receipt_text(path: str = RECEIPT_TEXT_PATH) -> dict[str, str]:
+    text = dict(RECEIPT_TEXT_DEFAULTS)
+    _ensure_receipt_text_file(path)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for lineno, raw in enumerate(f, start=1):
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    logging.warning("[TEXT] Ignoring malformed line %d: %r", lineno, raw.rstrip("\n"))
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().upper()
+                value = value.strip()
+                if key in text:
+                    text[key] = value
+                else:
+                    logging.warning("[TEXT] Unknown key %r on line %d", key, lineno)
+    except Exception as e:
+        logging.warning("Could not read receipt text file %s: %s", path, e)
+    return text
 
 
 # -----------------------------
@@ -36,7 +101,7 @@ class _ChunkedUsb(_BaseUsb):
     delay between each lets the printer drain its buffer while receiving.
     """
     _CHUNK = 2048   # bytes per USB write call
-    _DELAY = 0.40   # seconds between chunks (printer drain rate ~15-24 KB/s under load)
+    _DELAY = 0.08   # seconds between chunks (printer drain rate ~15-24 KB/s under load)
     # Maths: send rate = _CHUNK / _DELAY = 2048/0.30 ≈ 6.8 KB/s
     # At 40mm/s print speed × 8 dots/mm × 72 bytes/line ≈ 23 KB/s drain rate.
     # Under heavy thermal load (57% black) the effective drain rate drops; keeping
@@ -152,11 +217,11 @@ def _unbind_printer_from_kernel():
 def prep_photo(path: str, target_w: int) -> Image.Image:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
-    img = ImageOps.crop(img, border=10)
+    img = ImageOps.crop(img, border=5)
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Brightness(img).enhance(1.4)
-    img = ImageEnhance.Contrast(img).enhance(1.2)
+    img = ImageEnhance.Brightness(img).enhance(1.3)
+    img = ImageEnhance.Contrast(img).enhance(1.1)
     wpercent = target_w / float(img.size[0])
     hsize = int(float(img.size[1]) * wpercent)
     img = img.resize((target_w, hsize), Image.LANCZOS)
@@ -186,7 +251,12 @@ def make_qr(url: str, target_w: int) -> Image.Image:
 # PRINT
 # -----------------------------
 
-def print_receipt(photo_path: str, frame_id: str | None = None):
+def print_receipt(
+    photo_path: str,
+    frame_id: str | None = None,
+    reduce_factor: float = 1.0,
+    qr_url: str | None = None,
+):
     if not os.path.exists(photo_path):
         raise FileNotFoundError(photo_path)
 
@@ -195,65 +265,104 @@ def print_receipt(photo_path: str, frame_id: str | None = None):
     if frame_id is None:
         frame_id = now.strftime("%y%m%d-%H%M%S")
 
+    # Clamp scale: 1.0 = full width, 0.8 = 20% narrower.
+    try:
+        reduce_factor = float(reduce_factor)
+    except Exception:
+        reduce_factor = 1.0
+    reduce_factor = max(0.1, min(1.0, reduce_factor))
+    target_width = max(64, int(round(PRINTER_WIDTH * reduce_factor)))
+    text_cfg = load_receipt_text()
+    if qr_url is not None:
+        text_cfg["QR_URL"] = str(qr_url).strip()
+
     # _ChunkedUsb.__init__ calls detach_kernel_driver() directly via pyusb.
     # This works without root when the udev rule sets MODE="0666" on the
     # printer's USB device node.  No need for sysfs unbind or rmmod.
     logging.warning("[PRINT] Opening printer USB %04x:%04x", VENDOR_ID, PRODUCT_ID)
-    p = _ChunkedUsb(VENDOR_ID, PRODUCT_ID)
-
-    # Header
-    p.set(align="center", bold=True, width=2, height=2)
-    p.text(BRAND_TOP + "\n")
-    p.set(align="center", bold=False, width=1, height=1)
-    p.text(BRAND_SUB + "\n")
-    p.text("-" * 32 + "\n")
-
-    # Meta
-    p.set(align="center")
-    p.text(f"{stamp}\n")
-    p.text(f"FRAME: {frame_id}\n")
-    p.text("\n")
-
-    # Photo
-    photo = prep_photo(photo_path, PRINTER_WIDTH)
-    pixels = list(photo.getdata())
-    black = sum(1 for px in pixels if px == 0)
-    total = len(pixels)
-    pct = 100 * black // total if total else 0
     logging.warning(
-        "[PRINT] Photo: %dx%d px — %d/%d black dots (%d%%)",
-        photo.size[0], photo.size[1], black, total, pct,
+        "[PRINT] Width reduce_factor=%.2f -> target_width=%d (base=%d)",
+        reduce_factor, target_width, PRINTER_WIDTH
     )
-    if pct < 2:
-        logging.warning(
-            "[PRINT] Image is nearly all white (%d%% black) — source photo may be blank!", pct
-        )
-    p.image(photo)
-    p.text("\n")
+    p = _ChunkedUsb(VENDOR_ID, PRODUCT_ID)
+    try:
+        # Header
+        p.set(align="center", bold=True, width=2, height=2)
+        p.text(text_cfg["BRAND_TOP"] + "\n")
+        p.set(align="center", bold=False, width=1, height=1)
+        p.text(text_cfg["BRAND_SUB"] + "\n")
+        p.text("-" * 32 + "\n")
 
-    # QR
-    if QR_URL:
-        p.text("SCAN / DOWNLOAD\n")
-        p.image(make_qr(QR_URL, PRINTER_WIDTH))
+        # Meta
+        p.set(align="center")
+        p.text(f"{stamp}\n")
+        p.text(f"{text_cfg['FRAME_LABEL']}: {frame_id}\n")
         p.text("\n")
 
-    # Footer
-    p.set(align="center", bold=True)
-    p.text(FOOTER_1 + "\n")
-    p.set(align="center", bold=False)
-    p.text(FOOTER_2 + "\n")
-    p.text("\n\n")
-    p.cut()
-    logging.info("Receipt done.")
+        # Photo
+        photo = prep_photo(photo_path, target_width)
+        pixels = list(photo.getdata())
+        black = sum(1 for px in pixels if px == 0)
+        total = len(pixels)
+        pct = 100 * black // total if total else 0
+        logging.warning(
+            "[PRINT] Photo: %dx%d px — %d/%d black dots (%d%%)",
+            photo.size[0], photo.size[1], black, total, pct,
+        )
+        if pct < 2:
+            logging.warning(
+                "[PRINT] Image is nearly all white (%d%% black) — source photo may be blank!", pct
+            )
+        p.image(photo)
+        p.text("\n")
+
+        # QR
+        if text_cfg["QR_URL"]:
+            if text_cfg["SCAN_LABEL"]:
+                p.text(text_cfg["SCAN_LABEL"] + "\n")
+            p.image(make_qr(text_cfg["QR_URL"], target_width))
+            p.text("\n")
+
+        # Footer
+        p.set(align="center", bold=True)
+        p.text(text_cfg["FOOTER_1"] + "\n")
+        p.set(align="center", bold=False)
+        p.text(text_cfg["FOOTER_2"] + "\n")
+        p.text("\n\n")
+        p.cut()
+        logging.info("Receipt done.")
+    finally:
+        # Release the claimed interface after each job.
+        # Without an explicit close, the next open can fail with
+        # [Errno 16] Resource busy on set_configuration/claim.
+        close_err = None
+        try:
+            p.close()
+            logging.warning("[USB] Closed printer handle")
+        except Exception as e:
+            close_err = e
+        try:
+            import usb.util
+            dev = getattr(p, "device", None)
+            if dev is not None:
+                usb.util.dispose_resources(dev)
+                if close_err is not None:
+                    logging.warning("[USB] dispose_resources() after close error: %s", close_err)
+        except Exception:
+            if close_err is not None:
+                logging.warning("[USB] close(): %s", close_err)
 
 
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.DEBUG, format="%(asctime)s %(levelname)s: %(message)s")
     path = sys.argv[1] if len(sys.argv) > 1 else "test.jpg"
+    reduce_factor = float(sys.argv[2]) if len(sys.argv) > 2 else 1.0
+    qr_url = sys.argv[3] if len(sys.argv) > 3 else None
 
     # Sanity-check the image before printing
-    img = prep_photo(path, PRINTER_WIDTH)
+    target_w = max(64, int(round(PRINTER_WIDTH * max(0.1, min(1.0, reduce_factor)))))
+    img = prep_photo(path, target_w)
     pixels = list(img.getdata())
     black = sum(1 for px in pixels if px == 0)
     total = len(pixels)
@@ -262,4 +371,4 @@ if __name__ == "__main__":
     if pct < 1:
         print("WARNING: image is nearly all white — check brightness/exposure of source photo!")
 
-    print_receipt(path)
+    print_receipt(path, reduce_factor=reduce_factor, qr_url=qr_url)
