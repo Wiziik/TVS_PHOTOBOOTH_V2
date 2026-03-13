@@ -722,7 +722,9 @@ class PrintManager:
                     raise ValueError(
                         f"Photo file too small ({size} B) — capture may have failed"
                     )
-                for _ in range(self.copies):
+                for i in range(self.copies):
+                    if i > 0:
+                        time.sleep(15.0)  # cool-down between copies
                     print_receipt(
                         str(photo_path),
                         reduce_factor=self.image_reduce_factor,

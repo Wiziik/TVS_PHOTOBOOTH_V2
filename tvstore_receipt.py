@@ -101,12 +101,13 @@ class _ChunkedUsb(_BaseUsb):
     delay between each lets the printer drain its buffer while receiving.
     """
     _CHUNK = 2048   # bytes per USB write call
-    _DELAY = 0.08   # seconds between chunks (printer drain rate ~15-24 KB/s under load)
+    _DELAY = 0.30   # seconds between chunks — intentionally slow to reduce thermal load
     # Maths: send rate = _CHUNK / _DELAY = 2048/0.30 ≈ 6.8 KB/s
     # At 40mm/s print speed × 8 dots/mm × 72 bytes/line ≈ 23 KB/s drain rate.
-    # Under heavy thermal load (57% black) the effective drain rate drops; keeping
-    # send rate well below drain rate prevents the ~8 KB USB receive buffer from
-    # filling and causing an endpoint stall ([Errno 32] Pipe error).
+    # Keeping send rate ~7 KB/s (well below the ~23 KB/s drain rate) forces the
+    # printer to pause between rows, letting the thermal head cool down and
+    # preventing the mid-print thermal cutoff. USB buffer overflow is not a risk
+    # at this rate since the printer drains faster than we send.
 
     def __init__(self, vendor_id, product_id):
         import usb.core
