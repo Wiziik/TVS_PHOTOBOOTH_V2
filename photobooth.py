@@ -273,6 +273,9 @@ class AppConfig:
     copies:                 int            = 1
     image_reduce_factor:    float          = 1.0
     qr_url:                 str            = ""
+    print_brightness:       float          = 1.3
+    print_contrast:         float          = 1.1
+    idle_music:             str            = ""
     minimal_ui:             bool           = True
     countdown_wav:          str            = "./countdown.wav"
     shutter_wav:            str            = "./shutter.wav"
@@ -305,6 +308,8 @@ last_photo_show_seconds = 3
 brightness = 1.0
 countdown_wav = ./countdown.wav
 shutter_wav = ./shutter.wav
+; Music played on loop when idle. Leave empty to disable.
+idle_music =
 
 [filters]
 cycle = none,bw,retro
@@ -326,6 +331,10 @@ copies = 1
 image_reduce_factor = 1.0
 ; QR URL override from INI. Leave empty to use receipt_text.txt QR_URL
 qr_url =
+; Photo brightness before printing (1.0 = no change, >1 = lighter, <1 = darker)
+print_brightness = 1.3
+; Photo contrast before printing (1.0 = no change, >1 = more contrast)
+print_contrast = 1.1
 
 [camera]
 ; -1 = auto-scan device indices until one works
@@ -391,9 +400,12 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         copies                  = _int(prn.get("copies"), 1),
         image_reduce_factor     = clamp(_float(prn.get("image_reduce_factor"), 1.0), 0.1, 1.0),
         qr_url                  = str(prn.get("qr_url", "")).strip(),
+        print_brightness        = clamp(_float(prn.get("print_brightness"), 1.3), 0.1, 3.0),
+        print_contrast          = clamp(_float(prn.get("print_contrast"),   1.1), 0.1, 3.0),
         minimal_ui              = _bool(app.get("minimal_ui"), True),
         countdown_wav           = str(app.get("countdown_wav", "./countdown.wav")).strip(),
         shutter_wav             = str(app.get("shutter_wav",   "./shutter.wav")).strip(),
+        idle_music              = str(app.get("idle_music", "")).strip(),
         camera                  = cam_cfg,
     )
 
@@ -691,10 +703,14 @@ class PrintManager:
         copies: int = 1,
         image_reduce_factor: float = 1.0,
         qr_url: str = "",
+        print_brightness: float = 1.3,
+        print_contrast: float = 1.1,
     ) -> None:
         self.copies   = max(1, copies)
         self.image_reduce_factor = clamp(float(image_reduce_factor), 0.1, 1.0)
         self.qr_url = str(qr_url).strip()
+        self.print_brightness = clamp(float(print_brightness), 0.1, 3.0)
+        self.print_contrast   = clamp(float(print_contrast),   0.1, 3.0)
         self._lock    = threading.Lock()
         self._printing = False
 
@@ -729,6 +745,8 @@ class PrintManager:
                         str(photo_path),
                         reduce_factor=self.image_reduce_factor,
                         qr_url=self.qr_url,
+                        brightness=self.print_brightness,
+                        contrast=self.print_contrast,
                     )
                 msg = f"Printed {self.copies}x OK"
                 logging.info(msg)
@@ -786,6 +804,8 @@ class PhotoboothApp:
             copies=cfg.copies,
             image_reduce_factor=cfg.image_reduce_factor,
             qr_url=cfg.qr_url,
+            print_brightness=cfg.print_brightness,
+            print_contrast=cfg.print_contrast,
         )
         self._last_camera_ok = time.time()
 
@@ -813,6 +833,14 @@ class PhotoboothApp:
             self.snd_shutter   = safe_load_sound(cfg.shutter_wav)
             if self.snd_countdown: self.snd_countdown.set_volume(0.35)
             if self.snd_shutter:   self.snd_shutter.set_volume(0.50)
+            if cfg.idle_music:
+                music_path = Path(cfg.idle_music)
+                if music_path.exists():
+                    pygame.mixer.music.load(str(music_path))
+                    pygame.mixer.music.play(-1)  # -1 = loop forever
+                    logging.info("Idle music started: %s", music_path)
+                else:
+                    logging.warning("idle_music not found: %s", music_path)
         except Exception:
             logging.exception("Audio init failed (non-fatal).")
 
@@ -862,6 +890,19 @@ class PhotoboothApp:
                 ch.play(snd)
             else:
                 snd.play()
+        except Exception:
+            pass
+
+    def _music_pause(self) -> None:
+        try:
+            if pygame.mixer.music.get_busy():
+                pygame.mixer.music.pause()
+        except Exception:
+            pass
+
+    def _music_resume(self) -> None:
+        try:
+            pygame.mixer.music.unpause()
         except Exception:
             pass
 
@@ -940,6 +981,8 @@ class PhotoboothApp:
             self.camera.retry()
             return
 
+        self._music_pause()
+
         for t in range(self.countdown_seconds, 0, -1):
             self._play(self._ch_countdown, self.snd_countdown)
             self._draw_frame(countdown=t)
@@ -956,6 +999,7 @@ class PhotoboothApp:
         if img is None:
             self.set_status("Capture failed", 3.0)
             self.camera.retry()
+            self._music_resume()
             return
 
         dt       = now_dt()
@@ -996,6 +1040,9 @@ class PhotoboothApp:
         except Exception as e:
             logging.exception("Save failed: %s", e)
             self.set_status("Save failed", 3.0)
+
+        finally:
+            self._music_resume()
 
     # ---- drawing ----
 

@@ -215,14 +215,14 @@ def _unbind_printer_from_kernel():
 # IMAGE HELPERS
 # -----------------------------
 
-def prep_photo(path: str, target_w: int) -> Image.Image:
+def prep_photo(path: str, target_w: int, brightness: float = 1.3, contrast: float = 1.1) -> Image.Image:
     img = Image.open(path)
     img = ImageOps.exif_transpose(img)
     img = ImageOps.crop(img, border=5)
     img = img.convert("L")
     img = ImageOps.autocontrast(img)
-    img = ImageEnhance.Brightness(img).enhance(1.3)
-    img = ImageEnhance.Contrast(img).enhance(1.1)
+    img = ImageEnhance.Brightness(img).enhance(brightness)
+    img = ImageEnhance.Contrast(img).enhance(contrast)
     wpercent = target_w / float(img.size[0])
     hsize = int(float(img.size[1]) * wpercent)
     img = img.resize((target_w, hsize), Image.LANCZOS)
@@ -257,6 +257,8 @@ def print_receipt(
     frame_id: str | None = None,
     reduce_factor: float = 1.0,
     qr_url: str | None = None,
+    brightness: float = 1.3,
+    contrast: float = 1.1,
 ):
     if not os.path.exists(photo_path):
         raise FileNotFoundError(photo_path)
@@ -301,7 +303,7 @@ def print_receipt(
         p.text("\n")
 
         # Photo
-        photo = prep_photo(photo_path, target_width)
+        photo = prep_photo(photo_path, target_width, brightness=brightness, contrast=contrast)
         pixels = list(photo.getdata())
         black = sum(1 for px in pixels if px == 0)
         total = len(pixels)
