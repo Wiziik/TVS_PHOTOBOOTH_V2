@@ -555,13 +555,15 @@ class CameraController:
                     logging.info("Camera: OpenCV V4L2 index=%d", idx)
                     return
                 cap.release()
-            raise RuntimeError("No working V4L2 capture device found (tried indices 0-4)")
         except Exception as e:
-            logging.error("Camera init failed: %s", e)
-            self.backend = "none"
+            logging.error("Camera init failed (real backend): %s", e)
+
+        # Mock backend for headless/no-hardware testing
+        self.backend = "mock"
+        logging.info("Camera: MOCK mode (placeholder frames)")
 
     def available(self) -> bool:
-        return self.backend in ("picamera2", "opencv")
+        return self.backend in ("picamera2", "opencv", "mock")
 
     def retry(self) -> None:
         self.close()
@@ -582,7 +584,8 @@ class CameraController:
         except Exception:
             pass
         self._opencv_cap = None
-        self.backend = "none"
+        if self.backend != "mock":
+            self.backend = "none"
 
     @staticmethod
     def _to_rgb(arr: np.ndarray) -> np.ndarray:
@@ -595,6 +598,16 @@ class CameraController:
         if arr.ndim == 2:
             return np.stack([arr] * 3, axis=2)             # greyscale → RGB
         return arr                                         # assume RGB888 already
+
+    def _get_mock_frame(self) -> np.ndarray:
+        w, h = 1280, 720
+        arr = np.random.randint(40, 60, (h, w, 3), dtype=np.uint8)
+        # Add some "vibe"
+        ts = time.time()
+        c1 = int(127 + 127 * math.sin(ts))
+        c2 = int(127 + 127 * math.cos(ts))
+        arr[h//2-50:h//2+50, w//2-50:w//2+50] = [c1, c2, 180]
+        return arr
 
     def get_preview_frame(self) -> Optional[np.ndarray]:
         try:
@@ -609,6 +622,8 @@ class CameraController:
                 if not ok:
                     return None
                 return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if self.backend == "mock":
+                return self._get_mock_frame()
         except Exception:
             return None
 
@@ -628,6 +643,8 @@ class CameraController:
             if self.backend == "opencv" and self._opencv_cap is not None:
                 arr = self.get_preview_frame()
                 return Image.fromarray(arr, mode="RGB") if arr is not None else None
+            if self.backend == "mock":
+                return Image.fromarray(self._get_mock_frame(), mode="RGB")
         except Exception as e:
             logging.exception("Capture failed: %s", e)
             return None
@@ -779,10 +796,11 @@ class PrintManager:
 
 TRIGGER_PORT = 8080  # POST /trigger → injects a start_note MIDI event
 
-def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock"):
+def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock", midi_queue: "queue.Queue"):
     """
     POST /unlock  → grants one photo credit (called by payment server on success)
     GET  /credits → returns current credit count (for debugging)
+    POST /trigger → injects a virtual MIDI start_note (to trigger capture headlessly)
     """
     class UnlockHandler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -795,6 +813,14 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock"):
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
                 self.wfile.write(json.dumps({"ok": True, "credits": current}).encode())
+            elif self.path == "/trigger":
+                logging.info("Headless trigger received via HTTP")
+                # note=60 matches Leonardo middle C
+                midi_queue.put(MidiEvent(type="note_on", note=60, velocity=100))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -817,9 +843,9 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock"):
     return UnlockHandler
 
 
-def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock") -> None:
-    handler = _make_unlock_handler(credits_ref, credits_lock)
-    server  = HTTPServer(("127.0.0.1", TRIGGER_PORT), handler)
+def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock", midi_queue: "queue.Queue") -> None:
+    handler = _make_unlock_handler(credits_ref, credits_lock, midi_queue)
+    server  = HTTPServer(("0.0.0.0", TRIGGER_PORT), handler)
     t = threading.Thread(target=server.serve_forever, name="UnlockHTTP", daemon=True)
     t.start()
     logging.info("Payment unlock server listening on http://127.0.0.1:%d/unlock", TRIGGER_PORT)
@@ -854,7 +880,8 @@ class PhotoboothApp:
 
         self._payment_credits: list = [0]       # mutable for cross-thread access
         self._credits_lock = threading.Lock()
-        start_unlock_server(self._payment_credits, self._credits_lock)
+        self._credits_lock = threading.Lock()
+        start_unlock_server(self._payment_credits, self._credits_lock, self.midi_queue)
 
         self.camera  = CameraController(cfg.camera)
         self.printer = PrintManager(
@@ -1232,6 +1259,7 @@ def main() -> None:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
         handlers=[logging.StreamHandler(sys.stdout)],
+        force=True,
     )
     ensure_dirs()
 

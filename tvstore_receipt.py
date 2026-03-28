@@ -1,4 +1,4 @@
-from escpos.printer import Usb as _BaseUsb
+from escpos.printer import Usb as _BaseUsb, File as _BaseFile
 from PIL import Image, ImageOps, ImageEnhance
 import datetime as dt
 import logging
@@ -10,8 +10,8 @@ import qrcode
 # -----------------------------
 # CONFIG
 # -----------------------------
-VENDOR_ID = 0x0525
-PRODUCT_ID = 0xA700
+VENDOR_ID = 0x04B8
+PRODUCT_ID = 0x0E15
 
 # 80mm paper = 576 dots wide at 203 DPI; 72mm = 512 dots; 58mm = 384 dots
 PRINTER_WIDTH = 576
@@ -93,28 +93,13 @@ def load_receipt_text(path: str = RECEIPT_TEXT_PATH) -> dict[str, str]:
 # -----------------------------
 
 class _ChunkedUsb(_BaseUsb):
-    """python-escpos Usb backend with chunked writes.
-
-    The DS-920's USB receive buffer (~4-8 KB) overflows when the host sends
-    the full image (~30 KB) in one bulk transfer, causing the printer to stall
-    the endpoint ([Errno 32] Pipe error). Sending in 4 KB chunks with a small
-    delay between each lets the printer drain its buffer while receiving.
-    """
-    _CHUNK = 2048   # bytes per USB write call
-    _DELAY = 0.30   # seconds between chunks — intentionally slow to reduce thermal load
-    # Maths: send rate = _CHUNK / _DELAY = 2048/0.30 ≈ 6.8 KB/s
-    # At 40mm/s print speed × 8 dots/mm × 72 bytes/line ≈ 23 KB/s drain rate.
-    # Keeping send rate ~7 KB/s (well below the ~23 KB/s drain rate) forces the
-    # printer to pause between rows, letting the thermal head cool down and
-    # preventing the mid-print thermal cutoff. USB buffer overflow is not a risk
-    # at this rate since the printer drains faster than we send.
+    """python-escpos Usb backend with chunked writes and delays
+    to prevent the printer's receive buffer from overflowing."""
+    _CHUNK = 4096
+    _DELAY = 0.10
 
     def __init__(self, vendor_id, product_id):
         import usb.core
-        # Must be initialised before super().__init__() in case it calls _raw().
-        self._bytes_since_delay = 0
-        # Detach ALL kernel interfaces before super().__init__ tries to open.
-        # Requires either root OR udev MODE="0666" on the device (see setup instructions).
         dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
         if dev is not None:
             for cfg in dev:
@@ -123,52 +108,22 @@ class _ChunkedUsb(_BaseUsb):
                     try:
                         if dev.is_kernel_driver_active(ifnum):
                             dev.detach_kernel_driver(ifnum)
-                            logging.warning("[USB] Detached kernel driver from interface %d", ifnum)
-                        else:
-                            logging.warning("[USB] Interface %d: no kernel driver active", ifnum)
-                    except Exception as e:
-                        logging.warning("[USB] Detach iface %d FAILED: %s", ifnum, e)
-            # Do NOT reset the device here — reset causes the kernel to immediately
-            # re-bind its drivers before super().__init__ can claim the interfaces.
+                    except Exception:
+                        pass
         super().__init__(vendor_id, product_id)
-        # Clear any stale bulk-OUT endpoint halt left over from a previous
-        # failed print.  On Linux, libusb skips SET_CONFIGURATION when the
-        # device is already in that configuration, so the STALL condition is
-        # never reset and the very first write of the next job fails with
-        # [Errno 32] Pipe error.  An explicit CLEAR_FEATURE(ENDPOINT_HALT)
-        # control transfer fixes this without requiring a full device reset.
         try:
             self.device.clear_halt(self.out_ep)
-            logging.warning("[USB] Cleared endpoint halt on out_ep=0x%02x", self.out_ep)
-        except Exception as e:
-            logging.warning("[USB] clear_halt(out_ep): %s", e)
+        except Exception:
+            pass
 
     def _raw(self, msg: bytes) -> None:
-        """Rate-limit USB output to prevent printer buffer overflow.
-
-        Tracks cumulative bytes across ALL calls so that patterns of many
-        small _raw() calls (e.g. one per image row in some escpos versions)
-        are throttled the same as a single large call.
-        """
         offset = 0
         while offset < len(msg):
-            # How many bytes can we send before we must pause?
-            headroom = self._CHUNK - self._bytes_since_delay
-            if headroom <= 0:
-                time.sleep(self._DELAY)
-                self._bytes_since_delay = 0
-                headroom = self._CHUNK
-            chunk = msg[offset:offset + headroom]
+            chunk = msg[offset:offset + self._CHUNK]
             self.device.write(self.out_ep, chunk, self.timeout)
-            sent = len(chunk)
-            offset += sent
-            self._bytes_since_delay += sent
-            # Hit the threshold — pause before next chunk.
-            # Intentionally NO "and offset < len(msg)" so the sleep also
-            # fires at the end of a message, throttling the next _raw() call.
-            if self._bytes_since_delay >= self._CHUNK:
+            offset += len(chunk)
+            if offset < len(msg):
                 time.sleep(self._DELAY)
-                self._bytes_since_delay = 0
 
 
 def _unbind_printer_from_kernel():
@@ -240,7 +195,7 @@ def make_qr(url: str, target_w: int) -> Image.Image:
     qr.add_data(url)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white").convert("1")
-    qr_w = int(target_w * 0.55)
+    qr_w = int(target_w * 0.40)
     img = img.resize((qr_w, qr_w), Image.NEAREST)
     pad_left = (target_w - qr_w) // 2
     pad_right = target_w - qr_w - pad_left
@@ -279,9 +234,6 @@ def print_receipt(
     if qr_url is not None:
         text_cfg["QR_URL"] = str(qr_url).strip()
 
-    # _ChunkedUsb.__init__ calls detach_kernel_driver() directly via pyusb.
-    # This works without root when the udev rule sets MODE="0666" on the
-    # printer's USB device node.  No need for sysfs unbind or rmmod.
     logging.warning("[PRINT] Opening printer USB %04x:%04x", VENDOR_ID, PRODUCT_ID)
     logging.warning(
         "[PRINT] Width reduce_factor=%.2f -> target_width=%d (base=%d)",
@@ -289,10 +241,17 @@ def print_receipt(
     )
     p = _ChunkedUsb(VENDOR_ID, PRODUCT_ID)
     try:
+        # Set lower print density to prevent thermal stalls.
+        # GS 7 n1 n2: n1=heating dots (1-255), n2=heating time (3-15)
+        # Lower values = less heat = fewer stalls. Default is ~9,80.
+        p._raw(b'\x1d\x37\x04\x40')  # 4 heating dots, 64 heating time
+        # Set print speed to medium to reduce thermal load
+        p._raw(b'\x1d\x28\x4b\x02\x00\x31\x02')  # speed level 2 (slower)
+
         # Header
-        p.set(align="center", bold=True, width=2, height=2)
+        p.set(align="center", text_type="B", width=2, height=2)
         p.text(text_cfg["BRAND_TOP"] + "\n")
-        p.set(align="center", bold=False, width=1, height=1)
+        p.set(align="center", text_type="normal", width=1, height=1)
         p.text(text_cfg["BRAND_SUB"] + "\n")
         p.text("-" * 32 + "\n")
 
@@ -316,7 +275,7 @@ def print_receipt(
             logging.warning(
                 "[PRINT] Image is nearly all white (%d%% black) — source photo may be blank!", pct
             )
-        p.image(photo)
+        p.image(photo, impl="graphics", fragment_height=128)
         p.text("\n")
 
         # QR
@@ -327,33 +286,26 @@ def print_receipt(
             p.text("\n")
 
         # Footer
-        p.set(align="center", bold=True)
+        p.set(align="center", text_type="B")
         p.text(text_cfg["FOOTER_1"] + "\n")
-        p.set(align="center", bold=False)
+        p.set(align="center", text_type="normal")
         p.text(text_cfg["FOOTER_2"] + "\n")
         p.text("\n\n")
         p.cut()
         logging.info("Receipt done.")
     finally:
-        # Release the claimed interface after each job.
-        # Without an explicit close, the next open can fail with
-        # [Errno 16] Resource busy on set_configuration/claim.
-        close_err = None
         try:
             p.close()
-            logging.warning("[USB] Closed printer handle")
+            logging.warning("[PRINT] Closed printer handle")
         except Exception as e:
-            close_err = e
+            logging.warning("[PRINT] close(): %s", e)
         try:
             import usb.util
             dev = getattr(p, "device", None)
             if dev is not None:
                 usb.util.dispose_resources(dev)
-                if close_err is not None:
-                    logging.warning("[USB] dispose_resources() after close error: %s", close_err)
         except Exception:
-            if close_err is not None:
-                logging.warning("[USB] close(): %s", close_err)
+            pass
 
 
 if __name__ == "__main__":
