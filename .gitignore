@@ -1,0 +1,6 @@
+payment-server/.env
+payment-server/node_modules/
+__pycache__/
+*.pyc
+photos/
+prints_queue/

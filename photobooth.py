@@ -16,6 +16,7 @@ import dataclasses
 import json
 import logging
 import math
+from http.server import BaseHTTPRequestHandler, HTTPServer
 import os
 import queue
 import shutil
@@ -773,6 +774,58 @@ class PrintManager:
 
 
 # ---------------------------------------------------------------------------
+# Payment trigger HTTP server
+# ---------------------------------------------------------------------------
+
+TRIGGER_PORT = 8080  # POST /trigger → injects a start_note MIDI event
+
+def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock"):
+    """
+    POST /unlock  → grants one photo credit (called by payment server on success)
+    GET  /credits → returns current credit count (for debugging)
+    """
+    class UnlockHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            if self.path == "/unlock":
+                with credits_lock:
+                    credits_ref[0] += 1
+                    current = credits_ref[0]
+                logging.info("Payment received — credits now: %d", current)
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"ok": True, "credits": current}).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/credits":
+                with credits_lock:
+                    current = credits_ref[0]
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(json.dumps({"credits": current}).encode())
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, fmt, *args):  # silence default access log
+            pass
+
+    return UnlockHandler
+
+
+def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock") -> None:
+    handler = _make_unlock_handler(credits_ref, credits_lock)
+    server  = HTTPServer(("127.0.0.1", TRIGGER_PORT), handler)
+    t = threading.Thread(target=server.serve_forever, name="UnlockHTTP", daemon=True)
+    t.start()
+    logging.info("Payment unlock server listening on http://127.0.0.1:%d/unlock", TRIGGER_PORT)
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -798,6 +851,10 @@ class PhotoboothApp:
         self.midi_queue: "queue.Queue[MidiEvent]" = queue.Queue()
         self.midi = MidiController(cfg.midi_port_name, self.midi_queue)
         self.midi.start()
+
+        self._payment_credits: list = [0]       # mutable for cross-thread access
+        self._credits_lock = threading.Lock()
+        start_unlock_server(self._payment_credits, self._credits_lock)
 
         self.camera  = CameraController(cfg.camera)
         self.printer = PrintManager(
@@ -873,6 +930,16 @@ class PhotoboothApp:
         except Exception: pass
         pygame.quit()
 
+    # ---- payment credit helpers ----
+
+    def _consume_credit(self) -> bool:
+        """Returns True and decrements if a credit is available, False otherwise."""
+        with self._credits_lock:
+            if self._payment_credits[0] > 0:
+                self._payment_credits[0] -= 1
+                return True
+        return False
+
     # ---- status / helpers ----
 
     def set_status(self, msg: str, seconds: float = 2.0) -> None:
@@ -918,7 +985,10 @@ class PhotoboothApp:
         mm = self.cfg.midi_mapping
         if ev.type == "note_on" and ev.note is not None:
             if ev.note == mm.start_note and not self.delete_confirm_mode:
-                self._start_photo_sequence(ev)
+                if self._consume_credit():
+                    self._start_photo_sequence(ev)
+                else:
+                    self.set_status("Please pay first", 3.0)
             elif ev.note == mm.filter_note and not self.delete_confirm_mode:
                 self.cycle_filter()
             elif ev.note == mm.print_note and not self.delete_confirm_mode:
@@ -1130,8 +1200,11 @@ class PhotoboothApp:
                     if event.key in (pygame.K_ESCAPE, pygame.K_q):
                         self.running = False
                     elif event.key == pygame.K_SPACE:
-                        self._start_photo_sequence(
-                            MidiEvent(type="manual", raw={"type": "manual"}))
+                        if self._consume_credit():
+                            self._start_photo_sequence(
+                                MidiEvent(type="manual", raw={"type": "manual"}))
+                        else:
+                            self.set_status("Please pay first", 3.0)
                     elif event.key == pygame.K_f:
                         self.cycle_filter()
                     elif event.key == pygame.K_p:
