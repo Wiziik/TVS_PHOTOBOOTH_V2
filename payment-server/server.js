@@ -1,9 +1,9 @@
 /**
- * TVS Photobooth — SumUp payment daemon
+ * TVS Photobooth — SumUp payment daemon (Solo terminal)
  *
- * Creates a SumUp checkout, optionally sends it to a paired card reader,
- * polls for PAID status, triggers the printer, then immediately creates the
- * next checkout. Loops forever.
+ * Uses the Reader Checkout API: pushes the amount directly to the paired Solo,
+ * polls the merchant transactions endpoint for the resulting client_transaction_id
+ * until SUCCESSFUL, triggers the printer, then arms the reader again.
  */
 
 import "dotenv/config";
@@ -30,6 +30,7 @@ const {
 const missing = [];
 if (!SUMUP_API_KEY)       missing.push("SUMUP_API_KEY");
 if (!SUMUP_MERCHANT_CODE) missing.push("SUMUP_MERCHANT_CODE");
+if (!SUMUP_READER_ID)     missing.push("SUMUP_READER_ID");
 if (missing.length) {
   console.error(`[FATAL] Missing required env vars: ${missing.join(", ")}`);
   console.error("Copy .env.example to .env and fill in the values.");
@@ -60,11 +61,10 @@ function sumupHeaders() {
 // ---------------------------------------------------------------------------
 
 const state = {
-  status: "starting",    // starting | waiting | paid | failed | error
-  api_status: null,      // raw SumUp status string
-  checkout_id: null,
-  checkout_reference: null,
-  last_payment: null,    // { payment_id, amount, currency, timestamp }
+  status: "starting",           // starting | waiting | paid | failed | error
+  api_status: null,             // raw SumUp transaction status
+  client_transaction_id: null,
+  last_payment: null,           // { payment_id, amount, currency, timestamp }
   last_error: null,
   cycles: 0,
 };
@@ -83,69 +83,64 @@ function log(level, msg, extra = {}) {
 // SumUp API helpers
 // ---------------------------------------------------------------------------
 
-async function createCheckout() {
-  const reference = `PB-${Date.now()}-${randomUUID().slice(0, 8)}`;
-  const body = {
-    amount: AMOUNT_DECIMAL,
-    currency: CURRENCY.toUpperCase(),
-    checkout_reference: reference,
-    description: DESCRIPTION,
-    merchant_code: SUMUP_MERCHANT_CODE,
-    pay_to_email: undefined,   // not needed for card reader
-    // payment_type is set by the terminal itself; omitting is correct for REST checkout
-  };
-
-  const res = await fetch(`${SUMUP_BASE}/checkouts`, {
-    method: "POST",
-    headers: sumupHeaders(),
-    body: JSON.stringify(body),
-  });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`Create checkout HTTP ${res.status}: ${text}`);
-  }
-
-  const data = await res.json();
-  if (!data.id) throw new Error(`SumUp response missing checkout id: ${JSON.stringify(data)}`);
-  return data; // { id, checkout_reference, status: "PENDING", ... }
-}
-
 /**
- * Push checkout to a specific reader via SumUp Readers API.
- * Only called when SUMUP_READER_ID is set.
- * If not set, the paired reader auto-polls for PENDING checkouts associated
- * with the merchant — no explicit push needed.
+ * Start a checkout directly on the Solo reader.
+ * Returns the client_transaction_id that we will poll for status.
  */
-async function sendToReader(checkoutId) {
-  if (!SUMUP_READER_ID) return;
+async function startReaderCheckout() {
+  const clientTxId = `PB-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const body = {
+    total_amount: {
+      value: AMOUNT_NUM,                 // in minor units (cents)
+      currency: CURRENCY.toUpperCase(),
+      minor_unit: 2,
+    },
+    description: DESCRIPTION,
+    client_transaction_id: clientTxId,
+  };
 
   const res = await fetch(
     `${SUMUP_BASE}/merchants/${SUMUP_MERCHANT_CODE}/readers/${SUMUP_READER_ID}/checkout`,
     {
       method: "POST",
       headers: sumupHeaders(),
-      body: JSON.stringify({ checkout_id: checkoutId }),
+      body: JSON.stringify(body),
     }
   );
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Send-to-reader HTTP ${res.status}: ${text}`);
+    throw new Error(`Reader checkout HTTP ${res.status}: ${text}`);
   }
+
+  const data = await res.json().catch(() => ({}));
+  // Response: { data: { client_transaction_id } } — but SumUp sometimes echoes
+  // just the id we sent. Prefer server value if present, otherwise our own.
+  const returned = data?.data?.client_transaction_id || clientTxId;
+  return returned;
 }
 
-async function pollCheckout(checkoutId) {
-  const res = await fetch(`${SUMUP_BASE}/checkouts/${checkoutId}`, {
-    headers: sumupHeaders(),
-  });
+/**
+ * Look up a transaction by client_transaction_id.
+ * Returns the transaction object, or null if none exists yet (customer
+ * hasn't tapped — Solo creates the transaction only at tap time).
+ */
+async function getTransaction(clientTxId) {
+  const url = `${SUMUP_BASE}/me/transactions?client_transaction_id=${encodeURIComponent(clientTxId)}`;
+  const res = await fetch(url, { headers: sumupHeaders() });
 
+  if (res.status === 404) return null;
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Poll checkout HTTP ${res.status}: ${text}`);
+    throw new Error(`Get transaction HTTP ${res.status}: ${text}`);
   }
 
-  return res.json(); // { id, status: "PENDING"|"PAID"|"FAILED"|"CANCELLED", ... }
+  const data = await res.json().catch(() => null);
+  // Endpoint may return an object directly or an array wrapper
+  if (!data) return null;
+  if (Array.isArray(data)) return data[0] || null;
+  if (Array.isArray(data.items)) return data.items[0] || null;
+  return data;
 }
 
 // ---------------------------------------------------------------------------
@@ -193,105 +188,94 @@ async function triggerPrinter(paymentId) {
 let running = true;
 
 async function runLoop() {
-  let createBackoff = 2000;
+  let armBackoff = 2000;
 
   while (running) {
-    // ── Step 1: Create checkout, retry with exponential backoff ──────────────
-    let checkout = null;
+    // ── Step 1: Push checkout to Solo reader, retry with backoff ─────────────
+    let clientTxId = null;
     while (running) {
       try {
         state.status = "starting";
         state.last_error = null;
-        log("info", "Creating checkout", {
+        log("info", "Arming reader", {
           amount: `${AMOUNT_DECIMAL} ${CURRENCY}`,
           description: DESCRIPTION,
+          reader_id: SUMUP_READER_ID,
         });
 
-        checkout = await createCheckout();
-        state.checkout_id = checkout.id;
-        state.checkout_reference = checkout.checkout_reference;
-        state.api_status = checkout.status; // should be "PENDING"
-        createBackoff = 2000; // reset on success
-        log("info", "Checkout created", {
-          id: checkout.id,
-          reference: checkout.checkout_reference,
+        clientTxId = await startReaderCheckout();
+        state.client_transaction_id = clientTxId;
+        state.api_status = "PENDING";
+        armBackoff = 2000;
+        log("info", "Reader armed — waiting for tap", {
+          client_transaction_id: clientTxId,
         });
         break;
       } catch (err) {
         state.status = "error";
         state.last_error = err.message;
-        log("error", `Checkout creation failed — retry in ${createBackoff / 1000}s`, {
+        log("error", `Reader checkout failed — retry in ${armBackoff / 1000}s`, {
           error: err.message,
         });
-        await sleep(createBackoff);
-        createBackoff = Math.min(createBackoff * 2, 60_000);
+        await sleep(armBackoff);
+        armBackoff = Math.min(armBackoff * 2, 60_000);
       }
     }
 
-    if (!checkout) break; // only happens if running=false
+    if (!clientTxId) break; // only happens if running=false
 
-    // ── Step 2: Push to reader (optional) ────────────────────────────────────
-    try {
-      await sendToReader(checkout.id);
-      if (SUMUP_READER_ID) {
-        log("info", "Checkout sent to reader", { reader_id: SUMUP_READER_ID });
-      }
-    } catch (err) {
-      // Non-fatal: SumUp Air/Solo auto-polls for PENDING checkouts
-      log("warn", "Could not push to reader (reader will auto-poll)", {
-        error: err.message,
-      });
-    }
-
-    // ── Step 3: Poll until terminal status ────────────────────────────────────
+    // ── Step 2: Poll transaction by client_transaction_id ────────────────────
     state.status = "waiting";
-    log("info", "Reader ready — waiting for tap...", { checkout_id: checkout.id });
 
-    let paidData = null;
+    let paidTx = null;
     while (running) {
       await sleep(POLL_MS);
 
-      let data;
+      let tx;
       try {
-        data = await pollCheckout(checkout.id);
+        tx = await getTransaction(clientTxId);
       } catch (err) {
         log("warn", "Poll error (will retry next tick)", { error: err.message });
         continue;
       }
 
-      // Log only when the SumUp status actually changes
-      if (data.status !== state.api_status) {
-        log("info", "SumUp status changed", {
-          from: state.api_status,
-          to: data.status,
-          checkout_id: checkout.id,
-        });
-        state.api_status = data.status;
+      if (!tx) {
+        // No transaction yet — customer hasn't tapped. Keep waiting.
+        continue;
       }
 
-      if (data.status === "PAID") {
-        paidData = data;
+      if (tx.status && tx.status !== state.api_status) {
+        log("info", "Transaction status changed", {
+          from: state.api_status,
+          to: tx.status,
+          client_transaction_id: clientTxId,
+        });
+        state.api_status = tx.status;
+      }
+
+      if (tx.status === "SUCCESSFUL") {
+        paidTx = tx;
         state.status = "paid";
         break;
       }
 
-      if (data.status === "FAILED" || data.status === "CANCELLED") {
+      if (tx.status === "FAILED" || tx.status === "CANCELLED") {
         log("warn", "Checkout ended without payment — starting new cycle", {
-          status: data.status,
-          checkout_id: checkout.id,
+          status: tx.status,
+          client_transaction_id: clientTxId,
         });
         state.status = "failed";
         break;
       }
 
-      // PENDING: keep waiting
+      // PENDING / other: keep waiting
     }
 
-    // ── Step 4: On payment, record and trigger printer ────────────────────────
-    if (paidData) {
+    // ── Step 3: On payment, record and trigger printer ───────────────────────
+    if (paidTx) {
       state.cycles += 1;
       const payment = {
-        payment_id: paidData.id,
+        payment_id: paidTx.id || paidTx.transaction_code || clientTxId,
         amount: AMOUNT_NUM,
         currency: CURRENCY,
         timestamp: new Date().toISOString(),
@@ -302,7 +286,7 @@ async function runLoop() {
     }
 
     if (running) {
-      await sleep(300); // brief pause before next checkout
+      await sleep(300);
       log("info", `Cycle done (total paid: ${state.cycles}) — arming reader again`);
     }
   }
@@ -321,8 +305,7 @@ app.get("/status", (_req, res) => {
     reader_active: state.status === "waiting",
     status: state.status,
     api_status: state.api_status,
-    checkout_id: state.checkout_id,
-    checkout_reference: state.checkout_reference,
+    client_transaction_id: state.client_transaction_id,
     last_payment: state.last_payment,
     last_error: state.last_error,
     completed_cycles: state.cycles,

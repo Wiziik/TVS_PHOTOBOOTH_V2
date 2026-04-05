@@ -1255,10 +1255,15 @@ class PhotoboothApp:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    log_path = Path(__file__).parent / "logs" / "photobooth.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(log_path, mode="w", encoding="utf-8"),
+        ],
         force=True,
     )
     ensure_dirs()

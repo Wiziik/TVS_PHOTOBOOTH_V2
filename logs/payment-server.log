@@ -1,0 +1,20 @@
+[2026-04-05T19:48:34.843Z] [INFO ] TVS Photobooth payment daemon starting {"amount":"1 EUR","description":"Photo","merchant":"MW0Z8Y4D","reader":"rdr_49RE19RFSY8FCSPZ3EN998Z53B","printer":"http://localhost:8080/unlock","poll_interval_ms":2000}
+[2026-04-05T19:48:34.844Z] [INFO ] Arming reader {"amount":"1 EUR","description":"Photo","reader_id":"rdr_49RE19RFSY8FCSPZ3EN998Z53B"}
+[2026-04-05T19:48:34.914Z] [INFO ] Status endpoint → http://localhost:3000/status
+[2026-04-05T19:48:35.294Z] [INFO ] Reader armed — waiting for tap {"client_transaction_id":"b2f098ac-8b7d-40a1-b4a9-eec7cb7c3995"}
+[2026-04-05T19:48:45.813Z] [INFO ] Transaction status changed {"from":"PENDING","to":"SUCCESSFUL","client_transaction_id":"b2f098ac-8b7d-40a1-b4a9-eec7cb7c3995"}
+[2026-04-05T19:48:45.813Z] [INFO ] Payment #1 received {"payment_id":"f41907c0-c85f-4a80-8ccc-d64b438fc21b","amount":100,"currency":"EUR","timestamp":"2026-04-05T19:48:45.813Z"}
+[2026-04-05T19:48:45.818Z] [INFO ] Printer triggered successfully {"payment_id":"f41907c0-c85f-4a80-8ccc-d64b438fc21b","attempt":1}
+[2026-04-05T19:48:46.119Z] [INFO ] Cycle done (total paid: 1) — arming reader again
+[2026-04-05T19:48:46.119Z] [INFO ] Arming reader {"amount":"1 EUR","description":"Photo","reader_id":"rdr_49RE19RFSY8FCSPZ3EN998Z53B"}
+[2026-04-05T19:48:46.431Z] [INFO ] Reader armed — waiting for tap {"client_transaction_id":"ac7bd272-33e4-4ca0-a484-9a9f3d8d8c35"}
+[2026-04-05T19:49:01.392Z] [INFO ] Transaction status changed {"from":"PENDING","to":"SUCCESSFUL","client_transaction_id":"ac7bd272-33e4-4ca0-a484-9a9f3d8d8c35"}
+[2026-04-05T19:49:01.392Z] [INFO ] Payment #2 received {"payment_id":"deeece64-10e5-4f5b-a20b-a93770c1ea86","amount":100,"currency":"EUR","timestamp":"2026-04-05T19:49:01.392Z"}
+[2026-04-05T19:49:01.398Z] [INFO ] Printer triggered successfully {"payment_id":"deeece64-10e5-4f5b-a20b-a93770c1ea86","attempt":1}
+[2026-04-05T19:49:01.699Z] [INFO ] Cycle done (total paid: 2) — arming reader again
+[2026-04-05T19:49:01.700Z] [INFO ] Arming reader {"amount":"1 EUR","description":"Photo","reader_id":"rdr_49RE19RFSY8FCSPZ3EN998Z53B"}
+[2026-04-05T19:49:02.093Z] [ERROR] Reader checkout failed — retry in 2s {"error":"Reader checkout HTTP 422: {\"errors\":{\"detail\":\"There is a pending checkout for the device.\",\"type\":\"READER_BUSY\"}}"}
+[2026-04-05T19:49:04.094Z] [INFO ] Arming reader {"amount":"1 EUR","description":"Photo","reader_id":"rdr_49RE19RFSY8FCSPZ3EN998Z53B"}
+[2026-04-05T19:49:04.281Z] [INFO ] Reader armed — waiting for tap {"client_transaction_id":"10afd7ea-a750-4f40-9af2-53435958beab"}
+[2026-04-05T19:49:35.755Z] [INFO ] Received SIGTERM — stopping after current cycle
+[2026-04-05T19:49:38.758Z] [INFO ] Payment daemon stopped cleanly.

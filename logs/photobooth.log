@@ -1,0 +1,21 @@
+2026-04-05 21:48:36,770 INFO: Starting PiPhotobooth | midi=auto | fullscreen=True
+2026-04-05 21:48:36,776 INFO: MIDI connected: Arduino Leonardo:Arduino Leonardo MIDI 1 24:0
+2026-04-05 21:48:36,779 INFO: Payment unlock server listening on http://127.0.0.1:8080/unlock
+2026-04-05 21:48:36,779 WARNING: Picamera2 failed: No module named 'picamera2'
+2026-04-05 21:48:36,801 INFO: Camera: MOCK mode (placeholder frames)
+2026-04-05 21:48:36,823 INFO: Idle music started: tvstore.wav
+2026-04-05 21:48:36,824 WARNING: pygame set_mode failed for kmsdrm {'SDL_VIDEO_KMSDRM_DEVICE': '/dev/dri/card1'}: kmsdrm not available
+2026-04-05 21:48:36,824 WARNING: pygame set_mode failed for kmsdrm {'SDL_VIDEO_KMSDRM_DEVICE': '/dev/dri/card0'}: kmsdrm not available
+2026-04-05 21:48:36,824 WARNING: pygame set_mode failed for fbcon {'SDL_FBDEV': '/dev/fb0'}: fbcon not available
+2026-04-05 21:48:36,825 WARNING: pygame set_mode failed for wayland {}: wayland not available
+2026-04-05 21:48:37,454 INFO: Display driver: x11 ({'DISPLAY': ':0.0'})
+2026-04-05 21:48:37,473 INFO: Display driver: x11 | camera: mock
+2026-04-05 21:48:45,817 INFO: Payment received — credits now: 1
+2026-04-05 21:48:51,226 INFO: STATUS: Capture failed
+2026-04-05 21:48:51,627 WARNING: Picamera2 failed: No module named 'picamera2'
+2026-04-05 21:48:51,628 INFO: Camera: MOCK mode (placeholder frames)
+2026-04-05 21:48:55,736 INFO: STATUS: Please pay first
+2026-04-05 21:49:01,397 INFO: Payment received — credits now: 1
+2026-04-05 21:49:04,862 INFO: STATUS: Capture failed
+2026-04-05 21:49:05,263 WARNING: Picamera2 failed: No module named 'picamera2'
+2026-04-05 21:49:05,263 INFO: Camera: MOCK mode (placeholder frames)
