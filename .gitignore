@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 photos/
 prints_queue/
+secret.txt
