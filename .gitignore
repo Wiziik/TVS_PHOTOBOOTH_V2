@@ -1,7 +1,22 @@
+# Secrets (fill in after clone — see DOCS.md)
+photobooth.ini
 payment-server/.env
-payment-server/node_modules/
-__pycache__/
-*.pyc
+secret.txt
+web-server/.env
+web-server/.upload-token.secret
+
+# Runtime output
+logs/
 photos/
 prints_queue/
-secret.txt
+prints_queue_web/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Node
+payment-server/node_modules/
+web-server/node_modules/

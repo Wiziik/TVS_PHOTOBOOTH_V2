@@ -6,4 +6,5 @@ numpy==2.0.1
 opencv-python==4.13.0.92
 python-escpos==2.1.3
 qrcode==8.0
+requests>=2.32.0
 setuptools>=75.0.0

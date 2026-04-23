@@ -37,22 +37,9 @@ from PIL import Image, ImageEnhance, ImageOps
 import mido
 import pygame
 
-# ---------------------------------------------------------------------------
-# ESC/POS receipt — delegate to tvstore_receipt.py
-# ---------------------------------------------------------------------------
+from web_uploader import WebUploader, generate_ticket_code
 
-try:
-    from tvstore_receipt import print_receipt  # noqa: F401
-    logging.getLogger(__name__).debug("tvstore_receipt imported OK")
-except Exception as _e:
-    logging.getLogger(__name__).warning("tvstore_receipt import failed: %s", _e)
-    def print_receipt(
-        photo_path: str,
-        frame_id: str | None = None,
-        reduce_factor: float = 1.0,
-        qr_url: str | None = None,
-    ) -> None:  # type: ignore[misc]
-        raise RuntimeError(f"tvstore_receipt not available: {_e}")
+from tvstore_receipt import print_receipt
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +267,20 @@ class AppConfig:
     minimal_ui:             bool           = True
     countdown_wav:          str            = "./countdown.wav"
     shutter_wav:            str            = "./shutter.wav"
-    camera:                 CameraConfig   = dataclasses.field(default_factory=CameraConfig)
+    pay_overlay_image:        str          = "./logo.png"
+    pay_overlay_price_text:   str          = "1€ = 3 PHOTOS"
+    pay_overlay_footer_text:  str          = "PHOTOBOOTH // ANALOG DREAMS"
+    payment_accepted_text:    str          = "PAIEMENT ACCEPTÉ"
+    payment_accepted_seconds: float        = 1.8
+    ready_text:               str          = "PRÊT"
+    credits_per_unlock:       int          = 1
+    photos_per_session:       int          = 3
+    between_shots_seconds:    float        = 2.5
+    # Web upload (QR landing page + email delivery)
+    upload_url:               str          = ""
+    upload_token:             str          = ""
+    ticket_url_template:      str          = "https://photos.tvstore.fr/t/{code}"
+    camera:                   CameraConfig = dataclasses.field(default_factory=CameraConfig)
 
 
 def _bool(v, default):
@@ -311,6 +311,19 @@ countdown_wav = ./countdown.wav
 shutter_wav = ./shutter.wav
 ; Music played on loop when idle. Leave empty to disable.
 idle_music =
+; Overlay shown any time there are zero credits. Image path empty = no logo.
+pay_overlay_image = ./logo.png
+pay_overlay_price_text = 1€ = 3 PHOTOS
+pay_overlay_footer_text = PHOTOBOOTH // ANALOG DREAMS
+; Transition message shown for a moment after a successful /unlock.
+payment_accepted_text = PAIEMENT ACCEPTÉ
+payment_accepted_seconds = 1.8
+; One credit = one session. A session takes photos_per_session shots and prints them as a strip.
+credits_per_unlock = 1
+photos_per_session = 3
+; Pause between captures within a session (seconds). Shows ready_text while waiting.
+between_shots_seconds = 2.5
+ready_text = PRÊT
 
 [filters]
 cycle = none,bw,retro
@@ -347,6 +360,13 @@ picamera2_preview_height = 720
 picamera2_still_width = 3280
 picamera2_still_height = 2464
 picamera2_swap_rb = false
+
+[web]
+; Leave upload_url / upload_token empty to disable web upload (QR falls back to printer.qr_url).
+; Secrets — keep this section out of your public git push.
+upload_url =
+upload_token =
+ticket_url_template = https://photos.tvstore.fr/t/{code}
 """
 
 
@@ -363,6 +383,7 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
     midi = cp["midi"]     if cp.has_section("midi")    else {}
     prn  = cp["printer"]  if cp.has_section("printer") else {}
     cam  = cp["camera"]   if cp.has_section("camera")  else {}
+    web  = cp["web"]      if cp.has_section("web")     else {}
 
     cycle_raw    = str(filt.get("cycle", "none,bw,retro"))
     filter_cycle = tuple(x.strip() for x in cycle_raw.split(",") if x.strip()) or ("none",)
@@ -407,7 +428,19 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         countdown_wav           = str(app.get("countdown_wav", "./countdown.wav")).strip(),
         shutter_wav             = str(app.get("shutter_wav",   "./shutter.wav")).strip(),
         idle_music              = str(app.get("idle_music", "")).strip(),
-        camera                  = cam_cfg,
+        pay_overlay_image        = str(app.get("pay_overlay_image", "./logo.png")).strip(),
+        pay_overlay_price_text   = str(app.get("pay_overlay_price_text", "1€ = 3 PHOTOS")).strip(),
+        pay_overlay_footer_text  = str(app.get("pay_overlay_footer_text", "PHOTOBOOTH // ANALOG DREAMS")).strip(),
+        payment_accepted_text    = str(app.get("payment_accepted_text", "PAIEMENT ACCEPTÉ")).strip(),
+        payment_accepted_seconds = _float(app.get("payment_accepted_seconds"), 1.8),
+        ready_text               = str(app.get("ready_text", "PRÊT")).strip(),
+        credits_per_unlock       = max(1, _int(app.get("credits_per_unlock"), 1)),
+        photos_per_session       = max(1, _int(app.get("photos_per_session"), 3)),
+        between_shots_seconds    = max(0.0, _float(app.get("between_shots_seconds"), 2.5)),
+        upload_url               = str(web.get("upload_url", "")).strip(),
+        upload_token             = str(web.get("upload_token", "")).strip(),
+        ticket_url_template      = str(web.get("ticket_url_template", "https://photos.tvstore.fr/t/{code}")).strip(),
+        camera                   = cam_cfg,
     )
 
 
@@ -736,9 +769,18 @@ class PrintManager:
         with self._lock:
             return self._printing
 
-    def print_async(self, photo_path: Path,
-                    on_done: Optional[callable] = None) -> None:
-        """Queue a print job. Silently skips if already printing."""
+    def print_async(self, photo_paths,
+                    on_done: Optional[callable] = None,
+                    qr_url: Optional[str] = None) -> None:
+        """Queue a print job. Accepts a Path/str or an iterable of them.
+        Silently skips if already printing.
+        qr_url overrides the default (e.g. per-session ticket URL)."""
+        if isinstance(photo_paths, (str, Path)):
+            paths = [Path(photo_paths)]
+        else:
+            paths = [Path(p) for p in photo_paths]
+        effective_qr = qr_url if qr_url is not None else self.qr_url
+
         with self._lock:
             if self._printing:
                 logging.warning("Print already in progress, skipping.")
@@ -747,22 +789,23 @@ class PrintManager:
 
         def _worker():
             try:
-                # Verify the file exists and has reasonable content before printing
-                if not photo_path.exists():
-                    raise FileNotFoundError(f"Photo not found: {photo_path}")
-                size = photo_path.stat().st_size
-                logging.warning("[PRINT] Job: %s  (%.1f KB)", photo_path, size / 1024)
-                if size < 5_000:
-                    raise ValueError(
-                        f"Photo file too small ({size} B) — capture may have failed"
-                    )
+                for p in paths:
+                    if not p.exists():
+                        raise FileNotFoundError(f"Photo not found: {p}")
+                    size = p.stat().st_size
+                    if size < 5_000:
+                        raise ValueError(
+                            f"Photo file too small ({p.name}: {size} B) — capture may have failed"
+                        )
+                logging.warning("[PRINT] Job: %d photo(s) — %s",
+                                len(paths), ", ".join(p.name for p in paths))
                 for i in range(self.copies):
                     if i > 0:
                         time.sleep(15.0)  # cool-down between copies
                     print_receipt(
-                        str(photo_path),
+                        [str(p) for p in paths],
                         reduce_factor=self.image_reduce_factor,
-                        qr_url=self.qr_url,
+                        qr_url=effective_qr,
                         brightness=self.print_brightness,
                         contrast=self.print_contrast,
                     )
@@ -773,12 +816,12 @@ class PrintManager:
             except Exception as e:
                 msg = f"Print failed: {e}"
                 logging.error(msg)
-                # Fallback: copy to print queue
+                # Fallback: copy each to the print queue for later retry
                 try:
                     PRINT_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
-                    dest = PRINT_QUEUE_DIR / photo_path.name
-                    shutil.copy2(photo_path, dest)
-                    msg += f" (queued: {dest.name})"
+                    for p in paths:
+                        shutil.copy2(p, PRINT_QUEUE_DIR / p.name)
+                    msg += f" (queued: {len(paths)})"
                 except Exception:
                     pass
                 if on_done:
@@ -796,9 +839,10 @@ class PrintManager:
 
 TRIGGER_PORT = 8080  # POST /trigger → injects a start_note MIDI event
 
-def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock", midi_queue: "queue.Queue"):
+def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock",
+                         midi_queue: "queue.Queue", credits_per_unlock: int = 1):
     """
-    POST /unlock  → grants one photo credit (called by payment server on success)
+    POST /unlock  → grants credits_per_unlock photo credits (called by payment server on success)
     GET  /credits → returns current credit count (for debugging)
     POST /trigger → injects a virtual MIDI start_note (to trigger capture headlessly)
     """
@@ -806,7 +850,7 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock", midi
         def do_POST(self):
             if self.path == "/unlock":
                 with credits_lock:
-                    credits_ref[0] += 1
+                    credits_ref[0] += credits_per_unlock
                     current = credits_ref[0]
                 logging.info("Payment received — credits now: %d", current)
                 self.send_response(200)
@@ -843,8 +887,9 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock", midi
     return UnlockHandler
 
 
-def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock", midi_queue: "queue.Queue") -> None:
-    handler = _make_unlock_handler(credits_ref, credits_lock, midi_queue)
+def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock",
+                        midi_queue: "queue.Queue", credits_per_unlock: int = 1) -> None:
+    handler = _make_unlock_handler(credits_ref, credits_lock, midi_queue, credits_per_unlock)
     server  = HTTPServer(("0.0.0.0", TRIGGER_PORT), handler)
     t = threading.Thread(target=server.serve_forever, name="UnlockHTTP", daemon=True)
     t.start()
@@ -880,8 +925,8 @@ class PhotoboothApp:
 
         self._payment_credits: list = [0]       # mutable for cross-thread access
         self._credits_lock = threading.Lock()
-        self._credits_lock = threading.Lock()
-        start_unlock_server(self._payment_credits, self._credits_lock, self.midi_queue)
+        start_unlock_server(self._payment_credits, self._credits_lock, self.midi_queue,
+                            credits_per_unlock=int(cfg.credits_per_unlock))
 
         self.camera  = CameraController(cfg.camera)
         self.printer = PrintManager(
@@ -891,6 +936,15 @@ class PhotoboothApp:
             print_brightness=cfg.print_brightness,
             print_contrast=cfg.print_contrast,
         )
+        self.web_uploader = WebUploader(
+            upload_url=cfg.upload_url,
+            upload_token=cfg.upload_token,
+            queue_dir=Path("./prints_queue_web"),
+        )
+        if self.web_uploader.enabled:
+            logging.info("Web uploader enabled → %s", cfg.upload_url)
+        else:
+            logging.info("Web uploader disabled (no url/token); QR will use printer.qr_url")
         self._last_camera_ok = time.time()
 
         # Audio
@@ -945,6 +999,30 @@ class PhotoboothApp:
         self._thumb_cache_path: Optional[Path]           = None
         self._thumb_cache_surf: Optional[pygame.Surface] = None
 
+        self._pay_overlay_surf: Optional[pygame.Surface] = None
+        self._credits_prev: int = 0
+        self._payment_accepted_until: float = 0.0
+        self._in_session: bool = False
+        if cfg.pay_overlay_image:
+            try:
+                p = Path(cfg.pay_overlay_image).expanduser()
+                if not p.is_absolute():
+                    p = (Path(__file__).resolve().parent / p).resolve()
+                if p.exists():
+                    logo = pygame.image.load(str(p)).convert_alpha()
+                    max_w = int(self.w * 0.55)
+                    max_h = int(self.h * 0.55)
+                    lw, lh = logo.get_size()
+                    ratio = min(max_w / lw, max_h / lh)
+                    self._pay_overlay_surf = pygame.transform.smoothscale(
+                        logo, (int(lw * ratio), int(lh * ratio))
+                    )
+                    logging.info("Pay overlay loaded: %s", p)
+                else:
+                    logging.warning("pay_overlay_image not found: %s", p)
+            except Exception:
+                logging.exception("Failed to load pay_overlay_image")
+
         self.clock = pygame.time.Clock()
 
     # ---- lifecycle ----
@@ -954,6 +1032,8 @@ class PhotoboothApp:
         try: self.midi.stop()
         except Exception: pass
         try: self.camera.close()
+        except Exception: pass
+        try: self.web_uploader.stop()
         except Exception: pass
         pygame.quit()
 
@@ -966,6 +1046,10 @@ class PhotoboothApp:
                 self._payment_credits[0] -= 1
                 return True
         return False
+
+    def _has_credit(self) -> bool:
+        with self._credits_lock:
+            return self._payment_credits[0] > 0
 
     # ---- status / helpers ----
 
@@ -1014,8 +1098,6 @@ class PhotoboothApp:
             if ev.note == mm.start_note and not self.delete_confirm_mode:
                 if self._consume_credit():
                     self._start_photo_sequence(ev)
-                else:
-                    self.set_status("Please pay first", 3.0)
             elif ev.note == mm.filter_note and not self.delete_confirm_mode:
                 self.cycle_filter()
             elif ev.note == mm.print_note and not self.delete_confirm_mode:
@@ -1079,69 +1161,196 @@ class PhotoboothApp:
             return
 
         self._music_pause()
+        self._in_session = True
 
-        for t in range(self.countdown_seconds, 0, -1):
-            self._play(self._ch_countdown, self.snd_countdown)
-            self._draw_frame(countdown=t)
-            pygame.display.flip()
-            self.clock.tick(60)
-            time.sleep(1.0)
-
-        self._play(self._ch_shutter, self.snd_shutter)
-
-        # capture_still_and_stop() captures then fully shuts down the camera
-        # stream in one shot — no restart-then-immediately-close cycle that
-        # would disturb other USB devices on the shared bus.
-        img = self.camera.capture_still_and_stop()
-        if img is None:
-            self.set_status("Capture failed", 3.0)
-            self.camera.retry()
-            self._music_resume()
-            return
-
-        dt       = now_dt()
-        day_dir  = PHOTOS_DIR / today_folder_name(dt)
+        n = max(1, int(self.cfg.photos_per_session))
+        session_dt = now_dt()
+        day_dir    = PHOTOS_DIR / today_folder_name(session_dt)
         day_dir.mkdir(parents=True, exist_ok=True)
-        fname    = f"{timestamp_name(dt)}_{self.filter_name}.jpg"
-        photo_path = day_dir / fname
+        session_id   = timestamp_name(session_dt)
+        ticket_code  = generate_ticket_code()
+        photo_paths: list[Path] = []
 
         try:
-            processed = apply_filter(img, self.filter_name, self.brightness)
-            processed.save(photo_path, format="JPEG", quality=95)
-            safe_write_json(photo_path.with_suffix(".json"), {
-                "timestamp_iso":  dt.isoformat(),
-                "photo_path":     str(photo_path),
-                "filter":         self.filter_name,
-                "brightness":     self.brightness,
-                "countdown":      self.countdown_seconds,
-                "camera_backend": self.camera.backend,
-                "midi_trigger":   trigger.raw or {},
-            })
-            self.last_photo_path       = photo_path
-            self.last_photo_shown_until = time.time() + float(self.cfg.last_photo_show_seconds)
-            self._thumb_cache_path     = None
-            self._thumb_cache_surf     = None
-            logging.info("Saved: %s", photo_path)
+            for i in range(1, n + 1):
+                self.set_status(f"Photo {i}/{n}", float(self.countdown_seconds))
 
-            # Camera is already stopped by capture_still_and_stop().
-            # Give the USB host controller a moment to finish releasing
-            # the isochronous bandwidth before the printer bulk transfers begin.
+                for t in range(self.countdown_seconds, 0, -1):
+                    self._play(self._ch_countdown, self.snd_countdown)
+                    self._draw_frame(countdown=t)
+                    pygame.display.flip()
+                    self.clock.tick(60)
+                    time.sleep(1.0)
+
+                self._play(self._ch_shutter, self.snd_shutter)
+
+                # Keep camera running across shots; only stop after the last
+                # so its USB isochronous transfers don't compete with the printer.
+                if i < n:
+                    img = self.camera.capture_still()
+                else:
+                    img = self.camera.capture_still_and_stop()
+
+                if img is None:
+                    self.set_status(f"Capture {i}/{n} failed", 2.0)
+                    logging.warning("Capture %d/%d returned None", i, n)
+                    continue
+
+                shot_dt    = now_dt()
+                fname      = f"{session_id}_{ticket_code}_{i:02d}of{n:02d}_{self.filter_name}.jpg"
+                photo_path = day_dir / fname
+                try:
+                    processed = apply_filter(img, self.filter_name, self.brightness)
+                    processed.save(photo_path, format="JPEG", quality=95)
+                    safe_write_json(photo_path.with_suffix(".json"), {
+                        "timestamp_iso":  shot_dt.isoformat(),
+                        "photo_path":     str(photo_path),
+                        "session_id":     session_id,
+                        "ticket_code":    ticket_code,
+                        "session_index":  i,
+                        "session_total":  n,
+                        "filter":         self.filter_name,
+                        "brightness":     self.brightness,
+                        "countdown":      self.countdown_seconds,
+                        "camera_backend": self.camera.backend,
+                        "midi_trigger":   trigger.raw or {},
+                    })
+                    photo_paths.append(photo_path)
+                    self.last_photo_path        = photo_path
+                    self.last_photo_shown_until = time.time() + float(self.cfg.between_shots_seconds)
+                    self._thumb_cache_path      = None
+                    self._thumb_cache_surf      = None
+                    logging.info("Saved %d/%d: %s", i, n, photo_path)
+                except Exception as e:
+                    logging.exception("Save %d/%d failed: %s", i, n, e)
+                    self.set_status(f"Save {i}/{n} failed", 2.0)
+
+                # Short pause so the user sees their shot before the next countdown.
+                # Skip after the last since we're about to print.
+                if i < n:
+                    pause_until = time.time() + float(self.cfg.between_shots_seconds)
+                    while time.time() < pause_until:
+                        self._draw_frame()
+                        self._draw_ready_overlay()
+                        pygame.display.flip()
+                        self.clock.tick(30)
+
+            if not photo_paths:
+                self.set_status("Session failed", 3.0)
+                self.camera.retry()
+                return
+
+            # Compute per-session QR URL from the ticket code.
+            ticket_url = ""
+            if self.web_uploader.enabled and self.cfg.ticket_url_template:
+                try:
+                    ticket_url = self.cfg.ticket_url_template.format(code=ticket_code)
+                except Exception:
+                    ticket_url = ""
+                # Kick off upload immediately; runs in parallel with print.
+                self.web_uploader.queue(ticket_code, photo_paths)
+
+            # Camera is already stopped by capture_still_and_stop() for the last shot.
+            # Small USB cool-down before the printer bulk transfers begin.
             time.sleep(1.0)
 
             self.set_status("Printing…", 120.0)
             self.printer.print_async(
-                photo_path,
+                photo_paths,
                 on_done=lambda ok, msg: self.set_status(msg, 3.0),
+                qr_url=ticket_url or None,
             )
 
-        except Exception as e:
-            logging.exception("Save failed: %s", e)
-            self.set_status("Save failed", 3.0)
-
         finally:
+            self._in_session = False
             self._music_resume()
 
     # ---- drawing ----
+
+    def _draw_ready_overlay(self) -> None:
+        """Pulsing 'PRÊT' shown between captures within a session."""
+        text = self.cfg.ready_text
+        if not text:
+            return
+        pulse = 0.5 + 0.5 * math.sin((time.time() - self._t0) * 4.0)
+        draw_glow_text(
+            self.screen, text, self.font_big,
+            (self.w // 2, int(self.h * 0.46)),
+            Y2K["text"], Y2K["accent_lime"],
+            center=True, glow_px=10, glow_layers=7,
+            alpha_max=int(220 * pulse),
+        )
+
+    def _draw_payment_accepted(self) -> None:
+        """Brief confirmation after /unlock, before handing off to the live preview."""
+        # Lighter backdrop so the preview shows through and feels alive.
+        dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 110))
+        self.screen.blit(dim, (0, 0))
+
+        # Fade out over the last third of the window for a smooth handoff.
+        remaining = max(0.0, self._payment_accepted_until - time.time())
+        total = max(0.1, float(self.cfg.payment_accepted_seconds))
+        fade = min(1.0, remaining / (total / 3.0))
+
+        text = self.cfg.payment_accepted_text
+        if text:
+            draw_glow_text(
+                self.screen, text, self.font_big,
+                (self.w // 2, int(self.h * 0.44)),
+                Y2K["text"], Y2K["accent_lime"],
+                center=True, glow_px=10, glow_layers=7,
+                alpha_max=int(200 * fade),
+            )
+        # Credits available, as a sub-line
+        sub = f"{self._credits_prev} PHOTOS"
+        draw_glow_text(
+            self.screen, sub, self.font_med,
+            (self.w // 2, int(self.h * 0.58)),
+            Y2K["text"], Y2K["accent_cyan"],
+            center=True, glow_px=5, glow_layers=4,
+            alpha_max=int(170 * fade),
+        )
+
+    def _draw_pay_overlay(self) -> None:
+        """Pay-first screen: dim backdrop, blinking logo + price, solid footer."""
+        # Dim backdrop
+        dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 170))
+        self.screen.blit(dim, (0, 0))
+
+        # Blink — sin wave from 0.45 to 1.0
+        pulse = 0.725 + 0.275 * math.sin((time.time() - self._t0) * 3.2)
+
+        # Logo
+        logo_bottom_y = int(self.h * 0.36)
+        if self._pay_overlay_surf is not None:
+            logo = self._pay_overlay_surf.copy()
+            logo.set_alpha(int(255 * pulse))
+            rect = logo.get_rect(center=(self.w // 2, int(self.h * 0.38)))
+            self.screen.blit(logo, rect)
+            logo_bottom_y = rect.bottom
+
+        # Price text, blinking in sync with logo
+        price = self.cfg.pay_overlay_price_text
+        if price:
+            draw_glow_text(
+                self.screen, price, self.font_big,
+                (self.w // 2, logo_bottom_y + int(self.h * 0.10)),
+                Y2K["text"], Y2K["accent_magenta"],
+                center=True, glow_px=8, glow_layers=6,
+                alpha_max=int(180 * pulse),
+            )
+
+        # Footer (solid, not blinking)
+        footer = self.cfg.pay_overlay_footer_text
+        if footer:
+            draw_glow_text(
+                self.screen, footer, self.font_med,
+                (self.w // 2, self.h - int(self.h * 0.08)),
+                Y2K["text"], Y2K["accent_cyan"],
+                center=True, glow_px=4, glow_layers=4,
+            )
 
     def _rotate(self, rgb: np.ndarray) -> np.ndarray:
         deg = self.cfg.rotate_preview_degrees % 360
@@ -1206,6 +1415,20 @@ class PhotoboothApp:
                            Y2K["text"], Y2K["accent_cyan"],
                            center=True, glow_px=10, glow_layers=7)
 
+        # Detect 0→positive transition so we can show a brief "accepted" message.
+        with self._credits_lock:
+            credits_now = self._payment_credits[0]
+        if credits_now > self._credits_prev:
+            self._payment_accepted_until = time.time() + float(self.cfg.payment_accepted_seconds)
+        self._credits_prev = credits_now
+
+        # Overlays suppressed during an active session (countdown, capture, between-shot display).
+        if countdown is None and not self._in_session:
+            if time.time() < self._payment_accepted_until:
+                self._draw_payment_accepted()
+            elif credits_now == 0:
+                self._draw_pay_overlay()
+
         # Status message (shown even in minimal_ui)
         if self.status_message and time.time() < self.status_until:
             draw_glow_text(self.screen, self.status_message, self.font_hud,
@@ -1230,8 +1453,6 @@ class PhotoboothApp:
                         if self._consume_credit():
                             self._start_photo_sequence(
                                 MidiEvent(type="manual", raw={"type": "manual"}))
-                        else:
-                            self.set_status("Please pay first", 3.0)
                     elif event.key == pygame.K_f:
                         self.cycle_filter()
                     elif event.key == pygame.K_p:

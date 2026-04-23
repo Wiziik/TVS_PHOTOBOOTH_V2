@@ -8,4 +8,5 @@ FOOTER_1 = tvstore.fr
 FOOTER_2 = Merci - Keep the signal alive
 QR_URL = https://tvstore.fr
 FRAME_LABEL = FRAME
-SCAN_LABEL = SCAN / DOWNLOAD
+SCAN_LABEL = Scan pour récupérer tes photos en ligne.
+END_IMAGE = ./Do_not_throw_logo.png

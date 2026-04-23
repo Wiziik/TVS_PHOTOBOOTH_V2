@@ -1,0 +1,73 @@
+; ─────────────────────────────────────────────────────────────────────────
+; photobooth.ini.example — copy to photobooth.ini and fill in secrets.
+; photobooth.ini is gitignored. Never commit the real file.
+; ─────────────────────────────────────────────────────────────────────────
+
+[app]
+fullscreen = true
+minimal_ui = true
+rotate_preview_degrees = 0
+countdown_seconds = 3
+last_photo_show_seconds = 3
+brightness = 1.0
+countdown_wav = ./countdown.wav
+shutter_wav = ./shutter.wav
+; Music played on loop when idle. Leave empty to disable.
+idle_music = ./tvstore.wav
+; Overlay shown while credits == 0. Image path empty = no logo.
+pay_overlay_image = ./logo.png
+pay_overlay_price_text = 1€ = 3 PHOTOS
+pay_overlay_footer_text = PHOTOBOOTH // ANALOG DREAMS
+; Transition message between payment and live preview.
+payment_accepted_text = PAIEMENT ACCEPTÉ
+payment_accepted_seconds = 1.8
+; One credit = one session. A session takes photos_per_session shots and prints them as a strip.
+credits_per_unlock = 1
+photos_per_session = 3
+; Pause between captures within a session (seconds). Shows ready_text while waiting.
+between_shots_seconds = 2.5
+ready_text = PRÊT
+
+[filters]
+cycle = none,bw,retro
+default = none
+
+[midi]
+; leave empty to auto-pick (skips "Midi Through")
+port_name =
+start_note = 60
+filter_note = 38
+print_note = 40
+delete_note = 41
+brightness_cc = 1
+countdown_cc = 2
+
+[printer]
+copies = 1
+; 1.0 = full print width, lower = narrower image
+image_reduce_factor = 0.9
+; QR URL used if [web] is empty. When [web] is configured, per-session ticket URLs take over.
+qr_url = https://m.twitch.tv/tv_store/home
+; Photo brightness (1.0 = unchanged, >1 = lighter, <1 = darker)
+print_brightness = 1.5
+; Photo contrast (1.0 = unchanged, >1 = more contrast)
+print_contrast = 1.1
+
+[camera]
+; -1 = auto-scan device indices until one works
+opencv_device_index = -1
+opencv_width = 1280
+opencv_height = 720
+picamera2_preview_width = 1280
+picamera2_preview_height = 720
+picamera2_still_width = 3280
+picamera2_still_height = 2464
+picamera2_swap_rb = false
+
+[web]
+; Enables QR codes that open a mobile landing page for each session.
+; Leave upload_url or upload_token empty to disable and fall back to printer.qr_url.
+; SECRET — get upload_token from DOCS.md (password manager / deploy user).
+upload_url = https://photos.tvstore.fr/api/upload
+upload_token =
+ticket_url_template = https://photos.tvstore.fr/t/{code}

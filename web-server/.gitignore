@@ -1,0 +1,6 @@
+node_modules/
+.env
+.upload-token.secret
+data/
+photos/
+*.log

@@ -332,8 +332,9 @@ function sleep(ms) {
 // ---------------------------------------------------------------------------
 
 function shutdown(signal) {
-  log("info", `Received ${signal} — stopping after current cycle`);
+  log("info", `Received ${signal} — exiting`);
   running = false;
+  process.exit(0);
 }
 
 process.on("SIGINT",  () => shutdown("SIGINT"));

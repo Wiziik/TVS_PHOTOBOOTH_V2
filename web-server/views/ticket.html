@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Tes photos — TV STORE Photobooth</title>
+  <link rel="stylesheet" href="/public/style.css" />
+</head>
+<body>
+  <header>
+    <h1>TV STORE PHOTOBOOTH</h1>
+    <p class="sub">Ticket {{ ticket.code }}</p>
+  </header>
+
+  <main>
+    <section class="strip">
+      {% for url in photoUrls %}
+      <img src="{{ url }}" alt="Photo {{ loop.index }}" />
+      {% endfor %}
+    </section>
+
+    {% if alreadyEmailed %}
+    <section class="sent-notice">
+      <p>📬 Cet e-mail a déjà été utilisé pour recevoir ces photos.<br/>
+      Tu peux les re-demander à tout moment :</p>
+    </section>
+    {% endif %}
+
+    <form method="POST" action="/t/{{ ticket.code }}/email">
+      <label for="email">Entre ton e-mail pour recevoir tes photos</label>
+      <input type="email" id="email" name="email" required
+             autocomplete="email" placeholder="toi@exemple.com" />
+
+      <label class="check">
+        <input type="checkbox" name="marketing_opt_in" value="1" />
+        J'accepte de recevoir les actualités de TV STORE.
+      </label>
+
+      <button type="submit">Envoyer mes photos</button>
+    </form>
+
+    <p class="legal">
+      Les photos sont conservées {{ retentionDays }} jours puis supprimées.
+      En soumettant ce formulaire tu acceptes que ton adresse e-mail soit utilisée
+      pour t'envoyer tes photos.
+    </p>
+  </main>
+
+  <footer>
+    <p>tvstore.fr — PHOTOBOOTH // ANALOG DREAMS</p>
+  </footer>
+</body>
+</html>

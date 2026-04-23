@@ -1,16 +1,25 @@
 [Unit]
-Description=TVS Photobooth
-After=multi-user.target sound.target
+Description=TVS Photobooth (payment daemon + Pygame app)
+After=graphical.target sound.target network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
-User=pi
-WorkingDirectory=/home/pi/TVS_PHOTOBOOTH_V2
+User=tvs
+Group=tvs
+WorkingDirectory=/home/tvs/TVS_PHOTOBOOTH_V2
 Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/tvs
 Environment=DISPLAY=:0
-ExecStart=/home/pi/TVS_PHOTOBOOTH_V2/venv/bin/python3 /home/pi/TVS_PHOTOBOOTH_V2/photobooth.py
+Environment=XAUTHORITY=/home/tvs/.Xauthority
+ExecStart=/bin/bash /home/tvs/TVS_PHOTOBOOTH_V2/run.sh
 Restart=always
-RestartSec=3
+RestartSec=5
+# run.sh already forwards SIGTERM → cleanup → kill children
+KillSignal=SIGTERM
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=graphical.target

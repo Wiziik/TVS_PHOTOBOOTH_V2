@@ -25,16 +25,22 @@ echo "[run.sh] Starting photobooth -> logs/photobooth.log (+ $PB_CONSOLE_LOG for
 PB_PID=$!
 
 cleanup() {
+  trap - INT TERM
   echo
   echo "[run.sh] Stopping (payment=$PAY_PID photobooth=$PB_PID)"
   kill "$PAY_PID" "$PB_PID" 2>/dev/null || true
-  wait 2>/dev/null || true
+  # Give them 2s to exit cleanly, then SIGKILL anything left.
+  for _ in 1 2 3 4; do
+    kill -0 "$PAY_PID" 2>/dev/null || kill -0 "$PB_PID" 2>/dev/null || break
+    sleep 0.5
+  done
+  kill -9 "$PAY_PID" "$PB_PID" 2>/dev/null || true
   exit 0
 }
 trap cleanup INT TERM
 
 echo "[run.sh] Running. Payment PID=$PAY_PID  Photobooth PID=$PB_PID"
-echo "[run.sh] Tail logs:  tail -f $PAY_LOG $PB_LOG"
+echo "[run.sh] Tail logs:  tail -f $PAY_LOG logs/photobooth.log $PB_CONSOLE_LOG"
 
 # Exit if either child dies
 while kill -0 "$PAY_PID" 2>/dev/null && kill -0 "$PB_PID" 2>/dev/null; do

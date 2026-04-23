@@ -1,17 +1,32 @@
-from escpos.printer import Usb as _BaseUsb, File as _BaseFile
+from escpos.printer import Usb as _BaseUsb
 from PIL import Image, ImageOps, ImageEnhance
 import datetime as dt
 import logging
 import os
-import subprocess
 import time
 import qrcode
 
 # -----------------------------
 # CONFIG
 # -----------------------------
-VENDOR_ID = 0x04B8
-PRODUCT_ID = 0x0E15
+# Fallback only — by default the driver auto-detects the first USB device
+# that exposes a printer-class interface (bInterfaceClass == 0x07).
+VENDOR_ID = 0x0525
+PRODUCT_ID = 0xA700
+
+
+def _find_first_usb_printer() -> tuple[int, int]:
+    """Return (vid, pid) of the first USB device exposing a printer-class interface."""
+    import usb.core
+    for dev in usb.core.find(find_all=True) or []:
+        try:
+            for cfg in dev:
+                for intf in cfg:
+                    if intf.bInterfaceClass == 0x07:
+                        return int(dev.idVendor), int(dev.idProduct)
+        except Exception:
+            continue
+    raise RuntimeError("No USB printer-class device found.")
 
 # 80mm paper = 576 dots wide at 203 DPI; 72mm = 512 dots; 58mm = 384 dots
 PRINTER_WIDTH = 576
@@ -37,11 +52,13 @@ RECEIPT_TEXT_DEFAULTS = {
     "QR_URL": QR_URL,
     "FRAME_LABEL": FRAME_LABEL,
     "SCAN_LABEL": SCAN_LABEL,
+    "END_IMAGE": "",
 }
 
 RECEIPT_TEXT_TEMPLATE = """# Edit these values to customize printed text.
 # Format: KEY = value
 # Leave QR_URL empty to disable QR code printing.
+# Leave END_IMAGE empty to skip the end-of-receipt image.
 
 BRAND_TOP = 3615 TV STORE
 BRAND_SUB = PHOTOBOOTH // ANALOG DREAMS
@@ -49,7 +66,8 @@ FOOTER_1 = tvstore.fr
 FOOTER_2 = Merci • Keep the signal alive
 QR_URL = https://tvstore.fr
 FRAME_LABEL = FRAME
-SCAN_LABEL = SCAN / DOWNLOAD
+SCAN_LABEL = Scan pour récupérer tes photos en ligne.
+END_IMAGE = ./Do_not_throw_logo.png
 """
 
 
@@ -98,8 +116,17 @@ class _ChunkedUsb(_BaseUsb):
     _CHUNK = 4096
     _DELAY = 0.10
 
-    def __init__(self, vendor_id, product_id):
+    def __init__(self, vendor_id=None, product_id=None):
         import usb.core
+        if vendor_id is None or product_id is None:
+            try:
+                vendor_id, product_id = _find_first_usb_printer()
+                logging.warning("[PRINT] Auto-detected USB printer %04x:%04x",
+                                vendor_id, product_id)
+            except RuntimeError:
+                vendor_id, product_id = VENDOR_ID, PRODUCT_ID
+                logging.warning("[PRINT] Auto-detect failed; falling back to %04x:%04x",
+                                vendor_id, product_id)
         dev = usb.core.find(idVendor=vendor_id, idProduct=product_id)
         if dev is not None:
             for cfg in dev:
@@ -126,46 +153,6 @@ class _ChunkedUsb(_BaseUsb):
                 time.sleep(self._DELAY)
 
 
-def _unbind_printer_from_kernel():
-    """Surgically unbind kernel drivers (usblp, cdc_acm) from ONLY the printer's
-    USB interfaces using sysfs.  This leaves every other device (e.g. Arduino
-    Leonardo MIDI) completely untouched — unlike a global rmmod."""
-    import glob
-    VID_STR = f"{VENDOR_ID:04x}"
-    PID_STR = f"{PRODUCT_ID:04x}"
-    for driver in ("usblp", "cdc_acm"):
-        pattern = f"/sys/bus/usb/drivers/{driver}/*"
-        for path in glob.glob(pattern):
-            if not os.path.isdir(path):
-                continue
-            # Walk up to the USB device to read VID/PID
-            for rel in ("../../", "../"):
-                try:
-                    vid = open(os.path.join(path, rel, "idVendor")).read().strip()
-                    pid = open(os.path.join(path, rel, "idProduct")).read().strip()
-                    break
-                except OSError:
-                    vid = pid = ""
-            if vid != VID_STR or pid != PID_STR:
-                continue
-            iface = os.path.basename(path)
-            try:
-                with open(f"/sys/bus/usb/drivers/{driver}/unbind", "w") as f:
-                    f.write(iface)
-                logging.info("Unbound %s from %s", iface, driver)
-            except OSError as e:
-                # Need root — fall back to sudo rmmod for usblp only (safe)
-                logging.debug("sysfs unbind %s/%s: %s", driver, iface, e)
-                if driver == "usblp":
-                    try:
-                        subprocess.run(
-                            ["sudo", "rmmod", "usblp"],
-                            capture_output=True, timeout=3
-                        )
-                    except Exception:
-                        pass
-
-
 # -----------------------------
 # IMAGE HELPERS
 # -----------------------------
@@ -183,6 +170,27 @@ def prep_photo(path: str, target_w: int, brightness: float = 1.3, contrast: floa
     img = img.resize((target_w, hsize), Image.LANCZOS)
     img = img.convert("1")
     return img
+
+
+def prep_end_image(path: str, target_w: int, scale: float = 0.25) -> Image.Image:
+    """Load a small icon for the end of the receipt, fit to scale × printer width."""
+    img = Image.open(path)
+    img = ImageOps.exif_transpose(img)
+    # Flatten transparency against white so it prints cleanly
+    if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+        bg = Image.new("RGB", img.size, (255, 255, 255))
+        bg.paste(img.convert("RGBA"), mask=img.convert("RGBA").split()[-1])
+        img = bg
+    img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    dest_w = max(48, int(target_w * scale))
+    wpercent = dest_w / float(img.size[0])
+    dest_h = max(48, int(img.size[1] * wpercent))
+    img = img.resize((dest_w, dest_h), Image.LANCZOS)
+    img = img.convert("1")
+    pad_left = (target_w - dest_w) // 2
+    pad_right = target_w - dest_w - pad_left
+    return ImageOps.expand(img, border=(pad_left, 0, pad_right, 0), fill=1)
 
 
 def make_qr(url: str, target_w: int) -> Image.Image:
@@ -208,15 +216,21 @@ def make_qr(url: str, target_w: int) -> Image.Image:
 # -----------------------------
 
 def print_receipt(
-    photo_path: str,
+    photo_path,
     frame_id: str | None = None,
     reduce_factor: float = 1.0,
     qr_url: str | None = None,
     brightness: float = 1.3,
     contrast: float = 1.1,
 ):
-    if not os.path.exists(photo_path):
-        raise FileNotFoundError(photo_path)
+    # Accept a single path or a list — normalise to a list.
+    if isinstance(photo_path, (str, bytes, os.PathLike)):
+        photo_paths = [os.fspath(photo_path)]
+    else:
+        photo_paths = [os.fspath(p) for p in photo_path]
+    for pp in photo_paths:
+        if not os.path.exists(pp):
+            raise FileNotFoundError(pp)
 
     now = dt.datetime.now()
     stamp = now.strftime("%Y-%m-%d  %H:%M:%S")
@@ -234,21 +248,17 @@ def print_receipt(
     if qr_url is not None:
         text_cfg["QR_URL"] = str(qr_url).strip()
 
-    logging.warning("[PRINT] Opening printer USB %04x:%04x", VENDOR_ID, PRODUCT_ID)
     logging.warning(
-        "[PRINT] Width reduce_factor=%.2f -> target_width=%d (base=%d)",
-        reduce_factor, target_width, PRINTER_WIDTH
+        "[PRINT] Width reduce_factor=%.2f -> target_width=%d (base=%d) | %d photo(s)",
+        reduce_factor, target_width, PRINTER_WIDTH, len(photo_paths),
     )
-    p = _ChunkedUsb(VENDOR_ID, PRODUCT_ID)
+    p = _ChunkedUsb()
     try:
-        # Set lower print density to prevent thermal stalls.
-        # GS 7 n1 n2: n1=heating dots (1-255), n2=heating time (3-15)
-        # Lower values = less heat = fewer stalls. Default is ~9,80.
-        p._raw(b'\x1d\x37\x04\x40')  # 4 heating dots, 64 heating time
-        # Set print speed to medium to reduce thermal load
-        p._raw(b'\x1d\x28\x4b\x02\x00\x31\x02')  # speed level 2 (slower)
+        # ESC @ — reset/init. Widely supported; printers that don't know
+        # Epson-specific density/speed prelude would print those as garbage.
+        p._raw(b'\x1b\x40')
 
-        # Header
+        # Header (printed once per strip)
         p.set(align="center", text_type="B", width=2, height=2)
         p.text(text_cfg["BRAND_TOP"] + "\n")
         p.set(align="center", text_type="normal", width=1, height=1)
@@ -261,28 +271,34 @@ def print_receipt(
         p.text(f"{text_cfg['FRAME_LABEL']}: {frame_id}\n")
         p.text("\n")
 
-        # Photo
-        photo = prep_photo(photo_path, target_width, brightness=brightness, contrast=contrast)
-        pixels = list(photo.getdata())
-        black = sum(1 for px in pixels if px == 0)
-        total = len(pixels)
-        pct = 100 * black // total if total else 0
-        logging.warning(
-            "[PRINT] Photo: %dx%d px — %d/%d black dots (%d%%)",
-            photo.size[0], photo.size[1], black, total, pct,
-        )
-        if pct < 2:
+        # Photos stacked in order
+        for idx, pp in enumerate(photo_paths, start=1):
+            photo = prep_photo(pp, target_width, brightness=brightness, contrast=contrast)
+            pixels = list(photo.getdata())
+            black = sum(1 for px in pixels if px == 0)
+            total = len(pixels)
+            pct = 100 * black // total if total else 0
             logging.warning(
-                "[PRINT] Image is nearly all white (%d%% black) — source photo may be blank!", pct
+                "[PRINT] Photo %d/%d: %dx%d px — %d%% black",
+                idx, len(photo_paths), photo.size[0], photo.size[1], pct,
             )
-        p.image(photo, impl="graphics", fragment_height=128)
+            if pct < 2:
+                logging.warning(
+                    "[PRINT] Photo %d is nearly all white (%d%% black) — source may be blank!",
+                    idx, pct,
+                )
+            p.image(photo, impl="bitImageRaster", fragment_height=128)
+            # Small gap between photos on the strip
+            if idx < len(photo_paths):
+                p.text("\n")
+
         p.text("\n")
 
-        # QR
+        # QR (once, after all photos)
         if text_cfg["QR_URL"]:
             if text_cfg["SCAN_LABEL"]:
                 p.text(text_cfg["SCAN_LABEL"] + "\n")
-            p.image(make_qr(text_cfg["QR_URL"], target_width))
+            p.image(make_qr(text_cfg["QR_URL"], target_width), impl="bitImageRaster")
             p.text("\n")
 
         # Footer
@@ -290,7 +306,27 @@ def print_receipt(
         p.text(text_cfg["FOOTER_1"] + "\n")
         p.set(align="center", text_type="normal")
         p.text(text_cfg["FOOTER_2"] + "\n")
-        p.text("\n\n")
+        p.text("\n")
+
+        # End-of-receipt icon (e.g. "do not throw away")
+        end_image_path = text_cfg.get("END_IMAGE", "").strip()
+        if end_image_path:
+            if not os.path.isabs(end_image_path):
+                end_image_path = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), end_image_path
+                )
+            if os.path.exists(end_image_path):
+                try:
+                    end_img = prep_end_image(end_image_path, target_width)
+                    p.image(end_img, impl="bitImageRaster")
+                    p.text("\n")
+                except Exception as e:
+                    logging.warning("[PRINT] Failed to print END_IMAGE %s: %s",
+                                    end_image_path, e)
+            else:
+                logging.warning("[PRINT] END_IMAGE not found: %s", end_image_path)
+
+        p.text("\n")
         p.cut()
         logging.info("Receipt done.")
     finally:
