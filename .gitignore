@@ -4,6 +4,7 @@ payment-server/.env
 secret.txt
 web-server/.env
 web-server/.upload-token.secret
+scripts/laptop/wg-photo.conf.local
 
 # Runtime output
 logs/

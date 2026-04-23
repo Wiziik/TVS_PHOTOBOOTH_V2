@@ -341,6 +341,46 @@ ssh deploy@46.224.215.98 'cd /srv/tvs-photobooth/app && npm install --omit=dev &
 
 ---
 
+## 10b. Remote access (WireGuard + SSH, works from anywhere)
+
+The Hetzner VPS doubles as a WireGuard hub. Pi and laptop both dial out to it (UDP 51820), so you can SSH into the Pi regardless of where either machine is physically located — no port-forwarding at the venue required.
+
+```
+Laptop ──WG──▶ Hetzner VPS (46.224.215.98, hub) ◀──WG── Photobooth Pi
+                (10.9.0.1)
+Laptop = 10.9.0.3                                        Pi = 10.9.0.2
+```
+
+### Server side (already done)
+
+- `/etc/wireguard/wg-photo.conf` on the Hetzner VPS (server pubkey: `zCQSAUgMZKVavg/0vQVwVfiB/Y1XbbbDaYSVrNIUkx8=`)
+- Listens on UDP 51820 (opened in both UFW and the Hetzner Cloud firewall)
+- `net.ipv4.ip_forward = 1` + `iptables FORWARD ACCEPT` on the `wg-photo` interface
+- `systemctl enable wg-quick@wg-photo` — comes up at boot
+
+### Pi side (already done)
+
+- `/etc/wireguard/wg-photo.conf` on the Pi, `PersistentKeepalive = 25`
+- `systemctl enable wg-quick@wg-photo` — tunnel established at boot, survives NAT
+- Pi's WG identity at `10.9.0.2`
+
+### Laptop side (you install once)
+
+See `scripts/laptop/README.md`. Summary:
+
+1. Copy `scripts/laptop/wg-photo.conf.local` (gitignored, contains your laptop private key) → `/etc/wireguard/wg-photo.conf`.
+2. `sudo systemctl enable --now wg-quick@wg-photo`.
+3. Copy `scripts/laptop/photobooth-ssh.sh` → `~/bash_scripts/` and alias `photobooth_ssh`.
+4. `ssh-copy-id tvs@10.9.0.2` once, with the tunnel up.
+
+Then: `photobooth_ssh` from anywhere → lands on the Pi.
+
+### Coexistence with predapoitou
+
+`wg-photo` is a separate interface on a separate subnet (`10.9.0.0/24` vs `wg0` on `10.8.0.0/24`). Both can be up simultaneously.
+
+---
+
 ## 11. Troubleshooting
 
 | Symptom | Likely cause | Fix |
