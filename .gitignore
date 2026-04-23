@@ -5,6 +5,10 @@ secret.txt
 web-server/.env
 web-server/.upload-token.secret
 scripts/laptop/wg-photo.conf.local
+# Catch any stray WireGuard keys from interactive key generation
+*.key
+*.pub
+!Leonardo_MIDI_Note.ino
 
 # Runtime output
 logs/
