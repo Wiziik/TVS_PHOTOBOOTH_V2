@@ -4,9 +4,10 @@
 
 BRAND_TOP = 3615 TV STORE
 BRAND_SUB = PHOTOBOOTH // ANALOG DREAMS
+BRAND_HANDLES = @tvstore x @lerooftopmarseille
 FOOTER_1 = tvstore.fr
 FOOTER_2 = Merci - Keep the signal alive
 QR_URL = https://tvstore.fr
 FRAME_LABEL = FRAME
-SCAN_LABEL = Scan pour récupérer tes photos en ligne.
+SCAN_LABEL = Scan pour recuperer tes photos en ligne.
 END_IMAGE = ./Do_not_throw_logo.png

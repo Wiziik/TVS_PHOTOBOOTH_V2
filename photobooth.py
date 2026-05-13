@@ -273,6 +273,20 @@ class AppConfig:
     payment_accepted_text:    str          = "PAIEMENT ACCEPTÉ"
     payment_accepted_seconds: float        = 1.8
     ready_text:               str          = "PRÊT"
+    # Full-bleed layout PNGs (white-background designs). Take precedence over the
+    # text-based overlays above when set and the file exists.
+    pay_overlay_layout:        str          = "./Layout/Price.png"
+    payment_accepted_layout:   str          = "./Layout/Merci.png"
+    ready_layout:              str          = "./Layout/Tenezvousprets.png"
+    shot_splash_layouts:       Tuple[str,...] = ("./Layout/Photo_1.png",
+                                                 "./Layout/Photo_2.png",
+                                                 "./Layout/Photo_3.png")
+    shot_splash_seconds:       float        = 1.2
+    # Countdown overlay PNGs, indexed by countdown value: list[0]=1s, list[1]=2s, list[2]=3s.
+    # Empty path or out-of-range value falls back to the bevel/text overlay.
+    countdown_layouts:         Tuple[str,...] = ("./Layout/Countdown_1.png",
+                                                 "./Layout/Countdown_2.png",
+                                                 "./Layout/Countdown_3.png")
     credits_per_unlock:       int          = 1
     photos_per_session:       int          = 3
     between_shots_seconds:    float        = 2.5
@@ -324,6 +338,18 @@ photos_per_session = 3
 ; Pause between captures within a session (seconds). Shows ready_text while waiting.
 between_shots_seconds = 2.5
 ready_text = PRÊT
+; Full-bleed layout PNGs (white-background designs). Override the text overlays above.
+; Leave a path empty to fall back to text rendering.
+pay_overlay_layout = ./Layout/Price.png
+payment_accepted_layout = ./Layout/Merci.png
+ready_layout = ./Layout/Tenezvousprets.png
+; Per-shot splash images, comma-separated. Index N = shot N (1-based).
+shot_splash_layouts = ./Layout/Photo_1.png,./Layout/Photo_2.png,./Layout/Photo_3.png
+; How long each PhotoN.png splash is shown before that shot's countdown begins.
+shot_splash_seconds = 1.2
+; Countdown overlay PNGs, indexed by countdown value (item N is shown when countdown=N).
+; Falls back to the text/bevel overlay if the file is missing or countdown > len(list).
+countdown_layouts = ./Layout/Countdown_1.png,./Layout/Countdown_2.png,./Layout/Countdown_3.png
 
 [filters]
 cycle = none,bw,retro
@@ -434,6 +460,22 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         payment_accepted_text    = str(app.get("payment_accepted_text", "PAIEMENT ACCEPTÉ")).strip(),
         payment_accepted_seconds = _float(app.get("payment_accepted_seconds"), 1.8),
         ready_text               = str(app.get("ready_text", "PRÊT")).strip(),
+        pay_overlay_layout       = str(app.get("pay_overlay_layout", "./Layout/Price.png")).strip(),
+        payment_accepted_layout  = str(app.get("payment_accepted_layout", "./Layout/Merci.png")).strip(),
+        ready_layout             = str(app.get("ready_layout", "./Layout/Tenezvousprets.png")).strip(),
+        shot_splash_layouts      = tuple(
+            x.strip() for x in str(app.get(
+                "shot_splash_layouts",
+                "./Layout/Photo_1.png,./Layout/Photo_2.png,./Layout/Photo_3.png",
+            )).split(",") if x.strip()
+        ),
+        shot_splash_seconds      = max(0.0, _float(app.get("shot_splash_seconds"), 1.2)),
+        countdown_layouts        = tuple(
+            x.strip() for x in str(app.get(
+                "countdown_layouts",
+                "./Layout/Countdown_1.png,./Layout/Countdown_2.png,./Layout/Countdown_3.png",
+            )).split(",") if x.strip()
+        ),
         credits_per_unlock       = max(1, _int(app.get("credits_per_unlock"), 1)),
         photos_per_session       = max(1, _int(app.get("photos_per_session"), 3)),
         between_shots_seconds    = max(0.0, _float(app.get("between_shots_seconds"), 2.5)),
@@ -1023,7 +1065,41 @@ class PhotoboothApp:
             except Exception:
                 logging.exception("Failed to load pay_overlay_image")
 
+        # Full-bleed layout images (Price/Merci/Tenez_vous_prets/Photo1-3).
+        self._layout_pay      = self._load_layout_image(cfg.pay_overlay_layout)
+        self._layout_accepted = self._load_layout_image(cfg.payment_accepted_layout)
+        self._layout_ready    = self._load_layout_image(cfg.ready_layout)
+        self._layout_shots: list[Optional[pygame.Surface]] = [
+            self._load_layout_image(p) for p in cfg.shot_splash_layouts
+        ]
+        self._layout_countdowns: list[Optional[pygame.Surface]] = [
+            self._load_layout_image(p) for p in cfg.countdown_layouts
+        ]
+
         self.clock = pygame.time.Clock()
+
+    def _load_layout_image(self, path: str) -> Optional[pygame.Surface]:
+        """Load a layout PNG (preserving alpha) and stretch it to cover the full screen."""
+        if not path:
+            return None
+        try:
+            p = Path(path).expanduser()
+            if not p.is_absolute():
+                p = (Path(__file__).resolve().parent / p).resolve()
+            if not p.exists():
+                logging.warning("Layout image not found: %s", p)
+                return None
+            img = pygame.image.load(str(p)).convert_alpha()
+            scaled = pygame.transform.smoothscale(img, (self.w, self.h))
+            logging.info("Layout image loaded: %s -> %dx%d", p, self.w, self.h)
+            return scaled
+        except Exception:
+            logging.exception("Failed to load layout image: %s", path)
+            return None
+
+    def _blit_layout(self, surf: pygame.Surface) -> None:
+        """Blit a full-screen layout image, keeping its alpha so the preview shows through."""
+        self.screen.blit(surf, (0, 0))
 
     # ---- lifecycle ----
 
@@ -1173,6 +1249,7 @@ class PhotoboothApp:
 
         try:
             for i in range(1, n + 1):
+                self._show_shot_splash(i)
                 self.set_status(f"Photo {i}/{n}", float(self.countdown_seconds))
 
                 for t in range(self.countdown_seconds, 0, -1):
@@ -1183,6 +1260,7 @@ class PhotoboothApp:
                     time.sleep(1.0)
 
                 self._play(self._ch_shutter, self.snd_shutter)
+                self._flash_screen()
 
                 # Keep camera running across shots; only stop after the last
                 # so its USB isochronous transfers don't compete with the printer.
@@ -1225,13 +1303,16 @@ class PhotoboothApp:
                     logging.exception("Save %d/%d failed: %s", i, n, e)
                     self.set_status(f"Save {i}/{n} failed", 2.0)
 
-                # Short pause so the user sees their shot before the next countdown.
-                # Skip after the last since we're about to print.
+                # Short pause between shots: Tenez_vous_prets overlaid on the live preview.
+                # Skipped after the last shot since we're about to print.
                 if i < n:
                     pause_until = time.time() + float(self.cfg.between_shots_seconds)
                     while time.time() < pause_until:
-                        self._draw_frame()
-                        self._draw_ready_overlay()
+                        if self._layout_ready is not None:
+                            self._draw_frame(layout_overlay=self._layout_ready)
+                        else:
+                            self._draw_frame()
+                            self._draw_ready_overlay()
                         pygame.display.flip()
                         self.clock.tick(30)
 
@@ -1267,8 +1348,36 @@ class PhotoboothApp:
 
     # ---- drawing ----
 
+    def _flash_screen(self, hold_ms: int = 120) -> None:
+        """Camera-flash effect — full white painted right before the capture.
+        Capture runs during the hold, and the next draw cycle paints over it."""
+        self.screen.fill((255, 255, 255))
+        pygame.display.flip()
+        if hold_ms > 0:
+            pygame.time.wait(hold_ms)
+
+    def _show_shot_splash(self, shot_index: int) -> None:
+        """Show PhotoN.png as a transparent overlay above the live preview."""
+        if shot_index < 1 or shot_index > len(self._layout_shots):
+            return
+        surf = self._layout_shots[shot_index - 1]
+        if surf is None or self.cfg.shot_splash_seconds <= 0:
+            return
+        end = time.time() + float(self.cfg.shot_splash_seconds)
+        while time.time() < end and self.running:
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT:
+                    self.running = False
+                    return
+            self._draw_frame(layout_overlay=surf)
+            pygame.display.flip()
+            self.clock.tick(30)
+
     def _draw_ready_overlay(self) -> None:
-        """Pulsing 'PRÊT' shown between captures within a session."""
+        """Between-shots screen — Tenez_vous_prets.png full-bleed (or pulsing text fallback)."""
+        if self._layout_ready is not None:
+            self._blit_layout(self._layout_ready)
+            return
         text = self.cfg.ready_text
         if not text:
             return
@@ -1282,17 +1391,27 @@ class PhotoboothApp:
         )
 
     def _draw_payment_accepted(self) -> None:
-        """Brief confirmation after /unlock, before handing off to the live preview."""
-        # Lighter backdrop so the preview shows through and feels alive.
+        """Post-payment overlay — Merci.png blended over the live preview, fades out at the end."""
+        remaining = max(0.0, self._payment_accepted_until - time.time())
+        total = max(0.1, float(self.cfg.payment_accepted_seconds))
+
+        if self._layout_accepted is not None:
+            third = total / 3.0
+            if remaining < third:
+                # Fade the overlay's alpha so the camera feels alive again before countdown.
+                fade = max(0.0, remaining / third)
+                layer = self._layout_accepted.copy()
+                layer.set_alpha(int(255 * fade))
+                self.screen.blit(layer, layer.get_rect(center=(self.w // 2, self.h // 2)))
+            else:
+                self._blit_layout(self._layout_accepted)
+            return
+
+        # Fallback: text-based "Paiement accepté"
         dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
         dim.fill((0, 0, 0, 110))
         self.screen.blit(dim, (0, 0))
-
-        # Fade out over the last third of the window for a smooth handoff.
-        remaining = max(0.0, self._payment_accepted_until - time.time())
-        total = max(0.1, float(self.cfg.payment_accepted_seconds))
         fade = min(1.0, remaining / (total / 3.0))
-
         text = self.cfg.payment_accepted_text
         if text:
             draw_glow_text(
@@ -1302,7 +1421,6 @@ class PhotoboothApp:
                 center=True, glow_px=10, glow_layers=7,
                 alpha_max=int(200 * fade),
             )
-        # Credits available, as a sub-line
         sub = f"{self._credits_prev} PHOTOS"
         draw_glow_text(
             self.screen, sub, self.font_med,
@@ -1313,16 +1431,16 @@ class PhotoboothApp:
         )
 
     def _draw_pay_overlay(self) -> None:
-        """Pay-first screen: dim backdrop, blinking logo + price, solid footer."""
-        # Dim backdrop
+        """Idle screen — Price.png full-bleed (or text fallback when image is missing)."""
+        if self._layout_pay is not None:
+            self._blit_layout(self._layout_pay)
+            return
+
+        # Fallback: dim backdrop + blinking logo + price + footer text.
         dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
         dim.fill((0, 0, 0, 170))
         self.screen.blit(dim, (0, 0))
-
-        # Blink — sin wave from 0.45 to 1.0
         pulse = 0.725 + 0.275 * math.sin((time.time() - self._t0) * 3.2)
-
-        # Logo
         logo_bottom_y = int(self.h * 0.36)
         if self._pay_overlay_surf is not None:
             logo = self._pay_overlay_surf.copy()
@@ -1330,8 +1448,6 @@ class PhotoboothApp:
             rect = logo.get_rect(center=(self.w // 2, int(self.h * 0.38)))
             self.screen.blit(logo, rect)
             logo_bottom_y = rect.bottom
-
-        # Price text, blinking in sync with logo
         price = self.cfg.pay_overlay_price_text
         if price:
             draw_glow_text(
@@ -1341,8 +1457,6 @@ class PhotoboothApp:
                 center=True, glow_px=8, glow_layers=6,
                 alpha_max=int(180 * pulse),
             )
-
-        # Footer (solid, not blinking)
         footer = self.cfg.pay_overlay_footer_text
         if footer:
             draw_glow_text(
@@ -1362,58 +1476,65 @@ class PhotoboothApp:
             return rgb
         return np.clip(rgb.astype(np.float32) * self.brightness, 0, 255).astype(np.uint8)
 
-    def _draw_frame(self, countdown: Optional[int] = None) -> None:
+    def _draw_frame(self, countdown: Optional[int] = None,
+                    layout_overlay: Optional[pygame.Surface] = None) -> None:
         self.screen.fill((0, 0, 0))
 
         # Show last photo for a few seconds after capture
+        showing_last_photo = False
         if (self.last_photo_path and self.last_photo_path.exists()
                 and time.time() < self.last_photo_shown_until):
             try:
                 img  = Image.open(self.last_photo_path).convert("RGB")
-                img  = ImageOps.contain(img, (self.w, self.h))
+                img  = img.resize((self.w, self.h), Image.LANCZOS)
                 arr  = np.array(img)
                 surf = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
-                self.screen.blit(surf, surf.get_rect(center=(self.w // 2, self.h // 2)))
-                self.screen.blit(self._scanlines, (0, 0))
-                self.screen.blit(self._vignette,  (0, 0))
-                return
+                self.screen.blit(surf, (0, 0))
+                showing_last_photo = True
             except Exception:
                 pass
 
-        # Live preview
-        frame = self.camera.get_preview_frame() if self.camera.available() else None
-        if frame is None:
-            if time.time() - self._last_camera_ok > 2.0 and not self.printer.is_printing():
-                self.camera.retry()
+        if not showing_last_photo:
+            # Live preview
+            frame = self.camera.get_preview_frame() if self.camera.available() else None
+            if frame is None:
+                if time.time() - self._last_camera_ok > 2.0 and not self.printer.is_printing():
+                    self.camera.retry()
+                    self._last_camera_ok = time.time()
+                if not self.cfg.minimal_ui:
+                    draw_glow_text(self.screen, "CAMERA ERROR", self.font_big,
+                                   (self.w // 2, int(self.h * 0.38)),
+                                   (255, 200, 200), (255, 80, 80), center=True)
+            else:
                 self._last_camera_ok = time.time()
-            if not self.cfg.minimal_ui:
-                draw_glow_text(self.screen, "CAMERA ERROR", self.font_big,
-                               (self.w // 2, int(self.h * 0.38)),
-                               (255, 200, 200), (255, 80, 80), center=True)
-        else:
-            self._last_camera_ok = time.time()
-            frame = self._rotate(frame)
-            frame = self._brightness_array(frame)
-            img   = ImageOps.contain(Image.fromarray(frame, "RGB"), (self.w, self.h))
-            arr   = np.array(img)
-            surf  = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
-            self.screen.blit(surf, surf.get_rect(center=(self.w // 2, self.h // 2)))
+                frame = self._rotate(frame)
+                frame = self._brightness_array(frame)
+                img   = Image.fromarray(frame, "RGB").resize((self.w, self.h), Image.BILINEAR)
+                arr   = np.array(img)
+                surf  = pygame.surfarray.make_surface(arr.swapaxes(0, 1))
+                self.screen.blit(surf, (0, 0))
 
-        # Countdown overlay
+        # Countdown overlay — PNG (Countdown_N.png) if loaded, else bevel/text fallback.
         if countdown is not None:
-            t     = time.time()
-            pulse = 0.5 + 0.5 * math.sin((t - self._t0) * 2.8)
-            bw    = max(180, int(self.w * 0.22))
-            bh    = max(180, int(self.h * 0.30))
-            box   = pygame.Rect(self.w // 2 - bw // 2,
-                                int(self.h * 0.42) - bh // 2, bw, bh)
-            draw_bevel_panel(self.screen, box, (8, 10, 16, 120),
-                             (60, 255, 220, int(120 + 60 * pulse)),
-                             14, 2, 2)
-            draw_glow_text(self.screen, str(countdown), self.font_big,
-                           (self.w // 2, int(self.h * 0.42)),
-                           Y2K["text"], Y2K["accent_cyan"],
-                           center=True, glow_px=10, glow_layers=7)
+            cd_idx  = int(countdown) - 1
+            cd_surf = (self._layout_countdowns[cd_idx]
+                       if 0 <= cd_idx < len(self._layout_countdowns) else None)
+            if cd_surf is not None:
+                self._blit_layout(cd_surf)
+            else:
+                t     = time.time()
+                pulse = 0.5 + 0.5 * math.sin((t - self._t0) * 2.8)
+                bw    = max(180, int(self.w * 0.22))
+                bh    = max(180, int(self.h * 0.30))
+                box   = pygame.Rect(self.w // 2 - bw // 2,
+                                    int(self.h * 0.42) - bh // 2, bw, bh)
+                draw_bevel_panel(self.screen, box, (8, 10, 16, 120),
+                                 (60, 255, 220, int(120 + 60 * pulse)),
+                                 14, 2, 2)
+                draw_glow_text(self.screen, str(countdown), self.font_big,
+                               (self.w // 2, int(self.h * 0.42)),
+                               Y2K["text"], Y2K["accent_cyan"],
+                               center=True, glow_px=10, glow_layers=7)
 
         # Detect 0→positive transition so we can show a brief "accepted" message.
         with self._credits_lock:
@@ -1429,12 +1550,9 @@ class PhotoboothApp:
             elif credits_now == 0:
                 self._draw_pay_overlay()
 
-        # Status message (shown even in minimal_ui)
-        if self.status_message and time.time() < self.status_until:
-            draw_glow_text(self.screen, self.status_message, self.font_hud,
-                           (self.w // 2, self.h - int(self.h * 0.06)),
-                           Y2K["text"], Y2K["accent_cyan"],
-                           center=True, glow_px=4, glow_layers=4)
+        # Layout overlay (between content and post-effects, so scanlines stay on top).
+        if layout_overlay is not None:
+            self._blit_layout(layout_overlay)
 
         self.screen.blit(self._scanlines, (0, 0))
         self.screen.blit(self._vignette,  (0, 0))

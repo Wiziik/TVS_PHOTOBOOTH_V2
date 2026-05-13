@@ -33,6 +33,7 @@ PRINTER_WIDTH = 576
 
 BRAND_TOP = "3615 TV STORE"
 BRAND_SUB = "PHOTOBOOTH // ANALOG DREAMS"
+BRAND_HANDLES = "@tvstore x @lerooftopmarseille"
 FOOTER_1 = "tvstore.fr"
 FOOTER_2 = "Merci • Keep the signal alive"
 QR_URL = "https://tvstore.fr"
@@ -47,6 +48,7 @@ RECEIPT_TEXT_PATH = os.path.join(
 RECEIPT_TEXT_DEFAULTS = {
     "BRAND_TOP": BRAND_TOP,
     "BRAND_SUB": BRAND_SUB,
+    "BRAND_HANDLES": BRAND_HANDLES,
     "FOOTER_1": FOOTER_1,
     "FOOTER_2": FOOTER_2,
     "QR_URL": QR_URL,
@@ -62,11 +64,12 @@ RECEIPT_TEXT_TEMPLATE = """# Edit these values to customize printed text.
 
 BRAND_TOP = 3615 TV STORE
 BRAND_SUB = PHOTOBOOTH // ANALOG DREAMS
+BRAND_HANDLES = @tvstore x @lerooftopmarseille
 FOOTER_1 = tvstore.fr
 FOOTER_2 = Merci • Keep the signal alive
 QR_URL = https://tvstore.fr
 FRAME_LABEL = FRAME
-SCAN_LABEL = Scan pour récupérer tes photos en ligne.
+SCAN_LABEL = Scan pour recuperer tes photos en ligne.
 END_IMAGE = ./Do_not_throw_logo.png
 """
 
@@ -263,6 +266,8 @@ def print_receipt(
         p.text(text_cfg["BRAND_TOP"] + "\n")
         p.set(align="center", text_type="normal", width=1, height=1)
         p.text(text_cfg["BRAND_SUB"] + "\n")
+        if text_cfg.get("BRAND_HANDLES"):
+            p.text(text_cfg["BRAND_HANDLES"] + "\n")
         p.text("-" * 32 + "\n")
 
         # Meta
