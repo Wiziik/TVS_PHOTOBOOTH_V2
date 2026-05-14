@@ -61,11 +61,12 @@ function sumupHeaders() {
 // ---------------------------------------------------------------------------
 
 const state = {
-  status: "starting",           // starting | waiting | paid | failed | error
+  status: "idle",               // idle | starting | waiting | paid | failed | cancelled | error
   api_status: null,             // raw SumUp transaction status
   client_transaction_id: null,
   last_payment: null,           // { payment_id, amount, currency, timestamp }
   last_error: null,
+  cancelled: false,
   cycles: 0,
 };
 
@@ -182,119 +183,142 @@ async function triggerPrinter(paymentId) {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// On-demand arming session
 // ---------------------------------------------------------------------------
+//
+// The photobooth controls when the reader is armed. POST /arm starts an
+// arm-cycle that keeps the Solo armed (re-arming on SumUp's ~60 s server-side
+// timeout) until either a SUCCESSFUL tap → triggers /unlock → idles, or
+// POST /cancel from the photobooth (timeout or user pressed the button again).
 
 let running = true;
 
-async function runLoop() {
+const session = {
+  active:    false,   // true while an arm-cycle is in flight
+  cancelled: false,   // flipped by /cancel; arm-cycle observes between awaits
+};
+
+async function startArmingCycle() {
+  if (session.active) {
+    log("warn", "/arm received while already armed — ignoring");
+    return;
+  }
+  session.active    = true;
+  session.cancelled = false;
+  state.cancelled   = false;
+
   let armBackoff = 2000;
 
-  while (running) {
-    // ── Step 1: Push checkout to Solo reader, retry with backoff ─────────────
-    let clientTxId = null;
-    while (running) {
-      try {
-        state.status = "starting";
-        state.last_error = null;
-        log("info", "Arming reader", {
-          amount: `${AMOUNT_DECIMAL} ${CURRENCY}`,
-          description: DESCRIPTION,
-          reader_id: SUMUP_READER_ID,
-        });
+  try {
+    while (running && !session.cancelled) {
+      // ── Step 1: Push checkout to Solo reader, retry with backoff ───────────
+      let clientTxId = null;
+      while (running && !session.cancelled) {
+        try {
+          state.status = "starting";
+          state.last_error = null;
+          log("info", "Arming reader", {
+            amount: `${AMOUNT_DECIMAL} ${CURRENCY}`,
+            description: DESCRIPTION,
+            reader_id: SUMUP_READER_ID,
+          });
 
-        clientTxId = await startReaderCheckout();
-        state.client_transaction_id = clientTxId;
-        state.api_status = "PENDING";
-        armBackoff = 2000;
-        log("info", "Reader armed — waiting for tap", {
-          client_transaction_id: clientTxId,
-        });
-        break;
-      } catch (err) {
-        state.status = "error";
-        state.last_error = err.message;
-        log("error", `Reader checkout failed — retry in ${armBackoff / 1000}s`, {
-          error: err.message,
-        });
-        await sleep(armBackoff);
-        armBackoff = Math.min(armBackoff * 2, 60_000);
+          clientTxId = await startReaderCheckout();
+          state.client_transaction_id = clientTxId;
+          state.api_status = "PENDING";
+          armBackoff = 2000;
+          log("info", "Reader armed — waiting for tap", {
+            client_transaction_id: clientTxId,
+          });
+          break;
+        } catch (err) {
+          state.status = "error";
+          state.last_error = err.message;
+          log("error", `Reader checkout failed — retry in ${armBackoff / 1000}s`, {
+            error: err.message,
+          });
+          await sleep(armBackoff);
+          armBackoff = Math.min(armBackoff * 2, 60_000);
+        }
       }
+
+      if (!clientTxId) break;        // cancelled or shutting down
+
+      // ── Step 2: Poll transaction by client_transaction_id ──────────────────
+      state.status = "waiting";
+
+      let paidTx = null;
+      while (running && !session.cancelled) {
+        await sleep(POLL_MS);
+        if (session.cancelled) break;
+
+        let tx;
+        try {
+          tx = await getTransaction(clientTxId);
+        } catch (err) {
+          log("warn", "Poll error (will retry next tick)", { error: err.message });
+          continue;
+        }
+
+        if (!tx) continue;            // customer hasn't tapped yet
+
+        if (tx.status && tx.status !== state.api_status) {
+          log("info", "Transaction status changed", {
+            from: state.api_status,
+            to: tx.status,
+            client_transaction_id: clientTxId,
+          });
+          state.api_status = tx.status;
+        }
+
+        if (tx.status === "SUCCESSFUL") {
+          paidTx = tx;
+          state.status = "paid";
+          break;
+        }
+
+        if (tx.status === "FAILED" || tx.status === "CANCELLED") {
+          log("warn", "Checkout ended without payment — re-arming inside same session", {
+            status: tx.status,
+            client_transaction_id: clientTxId,
+          });
+          state.status = "failed";
+          break;
+        }
+      }
+
+      // ── Step 3: On payment, trigger printer and end the session ────────────
+      if (paidTx) {
+        state.cycles += 1;
+        const payment = {
+          payment_id: paidTx.id || paidTx.transaction_code || clientTxId,
+          amount: AMOUNT_NUM,
+          currency: CURRENCY,
+          timestamp: new Date().toISOString(),
+        };
+        state.last_payment = payment;
+        log("info", `Payment #${state.cycles} received — ending arm session`, payment);
+        await triggerPrinter(payment.payment_id);
+        break;        // exit cycle: one paid session = one /arm
+      }
+
+      // FAILED/CANCELLED inside the session — re-arm immediately unless cancelled.
+      if (session.cancelled) break;
+      await sleep(300);
     }
-
-    if (!clientTxId) break; // only happens if running=false
-
-    // ── Step 2: Poll transaction by client_transaction_id ────────────────────
-    state.status = "waiting";
-
-    let paidTx = null;
-    while (running) {
-      await sleep(POLL_MS);
-
-      let tx;
-      try {
-        tx = await getTransaction(clientTxId);
-      } catch (err) {
-        log("warn", "Poll error (will retry next tick)", { error: err.message });
-        continue;
-      }
-
-      if (!tx) {
-        // No transaction yet — customer hasn't tapped. Keep waiting.
-        continue;
-      }
-
-      if (tx.status && tx.status !== state.api_status) {
-        log("info", "Transaction status changed", {
-          from: state.api_status,
-          to: tx.status,
-          client_transaction_id: clientTxId,
-        });
-        state.api_status = tx.status;
-      }
-
-      if (tx.status === "SUCCESSFUL") {
-        paidTx = tx;
-        state.status = "paid";
-        break;
-      }
-
-      if (tx.status === "FAILED" || tx.status === "CANCELLED") {
-        log("warn", "Checkout ended without payment — starting new cycle", {
-          status: tx.status,
-          client_transaction_id: clientTxId,
-        });
-        state.status = "failed";
-        break;
-      }
-
-      // PENDING / other: keep waiting
-    }
-
-    // ── Step 3: On payment, record and trigger printer ───────────────────────
-    if (paidTx) {
-      state.cycles += 1;
-      const payment = {
-        payment_id: paidTx.id || paidTx.transaction_code || clientTxId,
-        amount: AMOUNT_NUM,
-        currency: CURRENCY,
-        timestamp: new Date().toISOString(),
-      };
-      state.last_payment = payment;
-      log("info", `Payment #${state.cycles} received`, payment);
-      await triggerPrinter(payment.payment_id);
-    }
-
-    if (running) {
-      // After a SUCCESSFUL payment the Solo needs ~1s to finalise before it
-      // will accept the next checkout — re-arming too fast returns READER_BUSY
-      // and leaves the reader unarmed during the 2s retry backoff.
-      await sleep(paidTx ? 1500 : 300);
-      log("info", `Cycle done (total paid: ${state.cycles}) — arming reader again`);
-    }
+  } finally {
+    session.active    = false;
+    state.status      = session.cancelled ? "cancelled" : (state.status === "paid" ? "paid" : "idle");
+    state.cancelled   = session.cancelled;
+    log("info", `Arm cycle ended (cancelled=${session.cancelled}, total paid=${state.cycles})`);
   }
+}
 
-  log("info", "Payment daemon stopped cleanly.");
+function cancelArmingCycle() {
+  if (!session.active) return false;
+  session.cancelled = true;
+  log("info", "/cancel received — current SumUp checkout will be allowed to time out on the device");
+  return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -302,24 +326,43 @@ async function runLoop() {
 // ---------------------------------------------------------------------------
 
 const app = express();
+app.use(express.json({ limit: "32kb" }));
 
 app.get("/status", (_req, res) => {
   res.json({
-    reader_active: state.status === "waiting",
-    status: state.status,
-    api_status: state.api_status,
+    reader_active: state.status === "waiting" || state.status === "starting",
+    armed:         session.active,
+    status:        state.status,
+    api_status:    state.api_status,
     client_transaction_id: state.client_transaction_id,
-    last_payment: state.last_payment,
-    last_error: state.last_error,
+    last_payment:  state.last_payment,
+    last_error:    state.last_error,
     completed_cycles: state.cycles,
     uptime_seconds: Math.floor(process.uptime()),
     config: {
       amount_cents: AMOUNT_NUM,
-      currency: CURRENCY,
-      description: DESCRIPTION,
-      reader_id: SUMUP_READER_ID ?? null,
+      currency:     CURRENCY,
+      description:  DESCRIPTION,
+      reader_id:    SUMUP_READER_ID ?? null,
     },
   });
+});
+
+// Photobooth → "arm the reader now, customer just finished a session"
+app.post("/arm", (_req, res) => {
+  if (session.active) {
+    return res.json({ ok: true, already_armed: true });
+  }
+  startArmingCycle().catch((err) => {
+    log("error", "Arm cycle crashed", { error: err.message, stack: err.stack });
+  });
+  res.json({ ok: true, armed: true });
+});
+
+// Photobooth → "user pressed the button again, or 120 s window elapsed"
+app.post("/cancel", (_req, res) => {
+  const wasActive = cancelArmingCycle();
+  res.json({ ok: true, was_active: wasActive });
 });
 
 // ---------------------------------------------------------------------------
@@ -352,16 +395,12 @@ app.listen(port, "0.0.0.0", () => {
   log("info", `Status endpoint → http://localhost:${port}/status`);
 });
 
-log("info", "TVS Photobooth payment daemon starting", {
+log("info", "TVS Photobooth payment daemon starting (on-demand mode)", {
   amount: `${AMOUNT_DECIMAL} ${CURRENCY}`,
   description: DESCRIPTION,
   merchant: SUMUP_MERCHANT_CODE,
-  reader: SUMUP_READER_ID ?? "(auto-paired — reader will poll for checkouts)",
+  reader: SUMUP_READER_ID ?? "(auto-paired)",
   printer: PRINTER_API_URL,
   poll_interval_ms: POLL_MS,
 });
-
-runLoop().catch((err) => {
-  log("error", "Fatal error in main loop", { error: err.message, stack: err.stack });
-  process.exit(1);
-});
+log("info", "Idle until POST /arm — the photobooth will request arming after each session.");

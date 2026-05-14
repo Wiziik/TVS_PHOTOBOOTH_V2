@@ -27,6 +27,15 @@ photos_per_session = 3
 ; Pause between captures within a session (seconds). Shows ready_text while waiting.
 between_shots_seconds = 2.5
 ready_text = PRÊT
+; Pay-after-capture flow: after the photos are taken, an offer screen invites
+; the user to pay for a printed copy. Set print_offer_seconds = 0 to disable
+; (the booth auto-prints every session as before).
+print_offer_seconds = 120
+print_offer_main_text = PAIE 2€ POUR IMPRIMER
+print_offer_sub_text = T'as 2 minutes pour imprimer ou appuie pour reprendre une photo
+print_offer_layout =
+; URL where the photobooth asks the payment server to arm/cancel the SumUp reader.
+payment_server_url = http://127.0.0.1:3000
 
 [filters]
 cycle = none,bw,retro

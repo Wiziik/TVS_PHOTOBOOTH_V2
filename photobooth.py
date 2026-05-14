@@ -24,6 +24,8 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -290,6 +292,17 @@ class AppConfig:
     credits_per_unlock:       int          = 1
     photos_per_session:       int          = 3
     between_shots_seconds:    float        = 2.5
+    # ── Pay-after-capture flow ────────────────────────────────────────────────
+    # Photos are taken for free; after a session a "pay to print" screen is shown
+    # for print_offer_seconds. Within that window: a /unlock from the payment
+    # server triggers the print, the user pressing the start button cancels the
+    # offer and starts a fresh session, and the timeout sends the booth back to
+    # idle. Set print_offer_seconds = 0 to disable the offer entirely (auto-print).
+    print_offer_seconds:      float        = 120.0
+    print_offer_main_text:    str          = "PAIE 2€ POUR IMPRIMER"
+    print_offer_sub_text:     str          = "T'as 2 minutes pour imprimer ou appuie pour reprendre une photo"
+    print_offer_layout:       str          = ""   # optional full-bleed PNG; empty = text overlay
+    payment_server_url:       str          = "http://127.0.0.1:3000"
     # Web upload (QR landing page + email delivery)
     upload_url:               str          = ""
     upload_token:             str          = ""
@@ -338,6 +351,15 @@ photos_per_session = 3
 ; Pause between captures within a session (seconds). Shows ready_text while waiting.
 between_shots_seconds = 2.5
 ready_text = PRÊT
+; Pay-after-capture flow: after the photos are taken, an offer screen invites
+; the user to pay for a printed copy. Set print_offer_seconds = 0 to disable
+; (the booth auto-prints every session as before).
+print_offer_seconds = 120
+print_offer_main_text = PAIE 2€ POUR IMPRIMER
+print_offer_sub_text = T'as 2 minutes pour imprimer ou appuie pour reprendre une photo
+print_offer_layout =
+; URL where the photobooth asks the payment server to arm/cancel the SumUp reader.
+payment_server_url = http://127.0.0.1:3000
 ; Full-bleed layout PNGs (white-background designs). Override the text overlays above.
 ; Leave a path empty to fall back to text rendering.
 pay_overlay_layout = ./Layout/Price.png
@@ -479,6 +501,13 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         credits_per_unlock       = max(1, _int(app.get("credits_per_unlock"), 1)),
         photos_per_session       = max(1, _int(app.get("photos_per_session"), 3)),
         between_shots_seconds    = max(0.0, _float(app.get("between_shots_seconds"), 2.5)),
+        print_offer_seconds      = max(0.0, _float(app.get("print_offer_seconds"), 120.0)),
+        print_offer_main_text    = str(app.get("print_offer_main_text",
+                                               "PAIE 2€ POUR IMPRIMER")).strip(),
+        print_offer_sub_text     = str(app.get("print_offer_sub_text",
+                                               "T'as 2 minutes pour imprimer ou appuie pour reprendre une photo")).strip(),
+        print_offer_layout       = str(app.get("print_offer_layout", "")).strip(),
+        payment_server_url       = str(app.get("payment_server_url", "http://127.0.0.1:3000")).strip(),
         upload_url               = str(web.get("upload_url", "")).strip(),
         upload_token             = str(web.get("upload_token", "")).strip(),
         ticket_url_template      = str(web.get("ticket_url_template", "https://photos.tvstore.fr/t/{code}")).strip(),
@@ -881,27 +910,27 @@ class PrintManager:
 
 TRIGGER_PORT = 8080  # POST /trigger → injects a start_note MIDI event
 
-def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock",
-                         midi_queue: "queue.Queue", credits_per_unlock: int = 1):
+def _make_unlock_handler(on_payment, midi_queue: "queue.Queue"):
     """
-    POST /unlock  → grants credits_per_unlock photo credits (called by payment server on success)
-    GET  /credits → returns current credit count (for debugging)
-    POST /trigger → injects a virtual MIDI start_note (to trigger capture headlessly)
+    POST /unlock  → called by the payment server when a card tap succeeded.
+                    Invokes on_payment() so the main loop can fire the pending print.
+    POST /trigger → injects a virtual MIDI start_note (headless capture trigger).
+    GET  /healthz → readiness probe.
     """
     class UnlockHandler(BaseHTTPRequestHandler):
         def do_POST(self):
             if self.path == "/unlock":
-                with credits_lock:
-                    credits_ref[0] += credits_per_unlock
-                    current = credits_ref[0]
-                logging.info("Payment received — credits now: %d", current)
+                logging.info("Payment unlock received from payment server")
+                try:
+                    on_payment()
+                except Exception:
+                    logging.exception("on_payment callback raised")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"ok": True, "credits": current}).encode())
+                self.wfile.write(json.dumps({"ok": True}).encode())
             elif self.path == "/trigger":
                 logging.info("Headless trigger received via HTTP")
-                # note=60 matches Leonardo middle C
                 midi_queue.put(MidiEvent(type="note_on", note=60, velocity=100))
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -912,13 +941,11 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock",
                 self.end_headers()
 
         def do_GET(self):
-            if self.path == "/credits":
-                with credits_lock:
-                    current = credits_ref[0]
+            if self.path == "/healthz":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.end_headers()
-                self.wfile.write(json.dumps({"credits": current}).encode())
+                self.wfile.write(json.dumps({"ok": True}).encode())
             else:
                 self.send_response(404)
                 self.end_headers()
@@ -929,9 +956,8 @@ def _make_unlock_handler(credits_ref: list, credits_lock: "threading.Lock",
     return UnlockHandler
 
 
-def start_unlock_server(credits_ref: list, credits_lock: "threading.Lock",
-                        midi_queue: "queue.Queue", credits_per_unlock: int = 1) -> None:
-    handler = _make_unlock_handler(credits_ref, credits_lock, midi_queue, credits_per_unlock)
+def start_unlock_server(on_payment, midi_queue: "queue.Queue") -> None:
+    handler = _make_unlock_handler(on_payment, midi_queue)
     server  = HTTPServer(("0.0.0.0", TRIGGER_PORT), handler)
     t = threading.Thread(target=server.serve_forever, name="UnlockHTTP", daemon=True)
     t.start()
@@ -965,10 +991,25 @@ class PhotoboothApp:
         self.midi = MidiController(cfg.midi_port_name, self.midi_queue)
         self.midi.start()
 
-        self._payment_credits: list = [0]       # mutable for cross-thread access
-        self._credits_lock = threading.Lock()
-        start_unlock_server(self._payment_credits, self._credits_lock, self.midi_queue,
-                            credits_per_unlock=int(cfg.credits_per_unlock))
+        # Pay-after-capture state. /unlock from the payment server sets this
+        # event; the main loop checks it each tick and, if a session is
+        # awaiting payment, fires the print and returns to idle.
+        #
+        # `_pending_print_paths` outlives `_awaiting_payment` by `_pending_grace_seconds`
+        # so a card tap arriving just after the photobooth's 120 s window
+        # (the payment server's poll might still return SUCCESSFUL after we
+        # already fired /cancel) still results in a printed strip rather
+        # than a paid-but-not-printed customer.
+        self._payment_event:        "threading.Event" = threading.Event()
+        self._pending_print_paths:  list[Path]        = []
+        self._pending_qr_url:       Optional[str]     = None
+        self._pending_expire_at:    float             = 0.0
+        self._pending_grace_seconds: float            = 10.0
+        self._print_offer_until:    float             = 0.0
+        self._awaiting_payment:     bool              = False
+        self._payment_server_url:   str               = cfg.payment_server_url.rstrip("/")
+
+        start_unlock_server(self._on_unlock_received, self.midi_queue)
 
         self.camera  = CameraController(cfg.camera)
         self.printer = PrintManager(
@@ -1042,7 +1083,6 @@ class PhotoboothApp:
         self._thumb_cache_surf: Optional[pygame.Surface] = None
 
         self._pay_overlay_surf: Optional[pygame.Surface] = None
-        self._credits_prev: int = 0
         self._payment_accepted_until: float = 0.0
         self._in_session: bool = False
         if cfg.pay_overlay_image:
@@ -1065,10 +1105,11 @@ class PhotoboothApp:
             except Exception:
                 logging.exception("Failed to load pay_overlay_image")
 
-        # Full-bleed layout images (Price/Merci/Tenez_vous_prets/Photo1-3).
-        self._layout_pay      = self._load_layout_image(cfg.pay_overlay_layout)
-        self._layout_accepted = self._load_layout_image(cfg.payment_accepted_layout)
-        self._layout_ready    = self._load_layout_image(cfg.ready_layout)
+        # Full-bleed layout images (Price/Merci/Tenez_vous_prets/Photo1-3 + optional print-offer).
+        self._layout_pay          = self._load_layout_image(cfg.pay_overlay_layout)
+        self._layout_accepted     = self._load_layout_image(cfg.payment_accepted_layout)
+        self._layout_ready        = self._load_layout_image(cfg.ready_layout)
+        self._layout_print_offer  = self._load_layout_image(cfg.print_offer_layout)
         self._layout_shots: list[Optional[pygame.Surface]] = [
             self._load_layout_image(p) for p in cfg.shot_splash_layouts
         ]
@@ -1113,19 +1154,114 @@ class PhotoboothApp:
         except Exception: pass
         pygame.quit()
 
-    # ---- payment credit helpers ----
+    # ---- pay-after-capture flow ----
 
-    def _consume_credit(self) -> bool:
-        """Returns True and decrements if a credit is available, False otherwise."""
-        with self._credits_lock:
-            if self._payment_credits[0] > 0:
-                self._payment_credits[0] -= 1
-                return True
-        return False
+    def _on_unlock_received(self) -> None:
+        """Called from the unlock HTTP-server thread when the payment daemon
+        reports a successful card tap. Just signals the main thread — actual
+        print firing happens in the next _tick_print_offer() iteration so all
+        state transitions stay on the pygame thread."""
+        self._payment_event.set()
 
-    def _has_credit(self) -> bool:
-        with self._credits_lock:
-            return self._payment_credits[0] > 0
+    def _post_payment_server(self, path: str) -> None:
+        """Fire-and-forget POST to the payment server (/arm or /cancel).
+        Runs in a background thread so the pygame loop never blocks on it."""
+        url = f"{self._payment_server_url}{path}"
+        def _worker():
+            try:
+                req = urllib.request.Request(url, method="POST",
+                                             headers={"Content-Type": "application/json"},
+                                             data=b"{}")
+                with urllib.request.urlopen(req, timeout=4.0) as resp:
+                    resp.read()
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                logging.warning("Payment server %s failed: %s", path, e)
+            except Exception:
+                logging.exception("Payment server %s raised", path)
+        threading.Thread(target=_worker, name=f"PayPOST{path}", daemon=True).start()
+
+    def _enter_print_offer(self, photo_paths: list, qr_url: Optional[str]) -> None:
+        """Transition to the AWAITING_PAYMENT state: store the session for later
+        printing, arm the SumUp reader, start the offer timer, set the overlay."""
+        self._pending_print_paths = list(photo_paths)
+        self._pending_qr_url      = qr_url
+        self._print_offer_until   = time.time() + float(self.cfg.print_offer_seconds)
+        self._pending_expire_at   = self._print_offer_until + self._pending_grace_seconds
+        self._awaiting_payment    = True
+        self._payment_event.clear()
+        # Hide any leftover status line from the capture sequence.
+        self.status_until = 0.0
+        self._post_payment_server("/arm")
+        logging.info("Print offer started — %d photo(s) pending, timeout in %.0fs",
+                     len(self._pending_print_paths), self.cfg.print_offer_seconds)
+
+    def _discard_pending(self) -> None:
+        """Forget the pending session entirely — paths, QR, the lot. Called when
+        the user starts a fresh session or the grace period expires."""
+        self._pending_print_paths = []
+        self._pending_qr_url      = None
+        self._pending_expire_at   = 0.0
+        self._awaiting_payment    = False
+        self._print_offer_until   = 0.0
+        self._payment_event.clear()
+
+    def _cancel_print_offer(self, reason: str) -> None:
+        """Hide the offer screen and tell the payment server to stop arming —
+        but keep the pending photos around for `_pending_grace_seconds` in case
+        a late /unlock from a tap that crossed the cancel boundary still arrives.
+        """
+        if not self._awaiting_payment:
+            return
+        logging.info("Print offer cancelled: %s", reason)
+        self._post_payment_server("/cancel")
+        self._awaiting_payment   = False
+        self._print_offer_until  = 0.0
+        # Keep _pending_print_paths / _pending_expire_at — race window.
+
+    def _fire_pending_print(self) -> None:
+        """Print the photos that were waiting on payment, flash the 'Merci'
+        overlay, and clear pending state. Called from _tick_print_offer."""
+        paths   = list(self._pending_print_paths)
+        qr_url  = self._pending_qr_url
+        self._discard_pending()
+        if not paths:
+            logging.warning("Payment received but no pending photos to print")
+            return
+        # Flash Merci.png briefly, same as the old credit-based flow did.
+        self._payment_accepted_until = time.time() + float(self.cfg.payment_accepted_seconds)
+        self.camera.close()  # free USB bandwidth for the printer
+        self.set_status("Printing…", 120.0)
+        self.printer.print_async(
+            paths,
+            on_done=lambda ok, msg: self.set_status(msg, 3.0),
+            qr_url=qr_url or None,
+        )
+
+    def _tick_print_offer(self) -> None:
+        """Called once per main-loop iteration. Drives the AWAITING_PAYMENT
+        state forward: prints if payment arrived, cancels at the 120 s window,
+        discards stale pending paths after the grace window."""
+        # A late /unlock — print even if we already cancelled, as long as we
+        # still have the paths in the grace window.
+        if self._payment_event.is_set():
+            self._payment_event.clear()
+            if self._pending_print_paths:
+                self._fire_pending_print()
+            else:
+                logging.warning("/unlock received but no pending session to print")
+            return
+
+        if self._awaiting_payment and time.time() >= self._print_offer_until:
+            self._cancel_print_offer(reason="print offer expired (timeout)")
+            return
+
+        # Garbage-collect a pending session that survived a cancel but never
+        # got paid in the grace window.
+        if (not self._awaiting_payment
+                and self._pending_print_paths
+                and time.time() >= self._pending_expire_at):
+            logging.info("Pending print discarded (grace window elapsed)")
+            self._discard_pending()
 
     # ---- status / helpers ----
 
@@ -1172,8 +1308,11 @@ class PhotoboothApp:
         mm = self.cfg.midi_mapping
         if ev.type == "note_on" and ev.note is not None:
             if ev.note == mm.start_note and not self.delete_confirm_mode:
-                if self._consume_credit():
-                    self._start_photo_sequence(ev)
+                if self._awaiting_payment:
+                    self._cancel_print_offer(reason="user pressed start button")
+                # New session = forget any lingering paths from a prior offer.
+                self._discard_pending()
+                self._start_photo_sequence(ev)
             elif ev.note == mm.filter_note and not self.delete_confirm_mode:
                 self.cycle_filter()
             elif ev.note == mm.print_note and not self.delete_confirm_mode:
@@ -1332,15 +1471,21 @@ class PhotoboothApp:
                 self.web_uploader.queue(ticket_code, photo_paths)
 
             # Camera is already stopped by capture_still_and_stop() for the last shot.
-            # Small USB cool-down before the printer bulk transfers begin.
+            # Small USB cool-down before whatever happens next on the bus.
             time.sleep(1.0)
 
-            self.set_status("Printing…", 120.0)
-            self.printer.print_async(
-                photo_paths,
-                on_done=lambda ok, msg: self.set_status(msg, 3.0),
-                qr_url=ticket_url or None,
-            )
+            if float(self.cfg.print_offer_seconds) > 0:
+                # Pay-after-capture: photos are saved + uploaded already; ask the
+                # payment server to arm and let the user decide whether to print.
+                self._enter_print_offer(photo_paths, ticket_url)
+            else:
+                # Legacy / kiosk mode: auto-print every session.
+                self.set_status("Printing…", 120.0)
+                self.printer.print_async(
+                    photo_paths,
+                    on_done=lambda ok, msg: self.set_status(msg, 3.0),
+                    qr_url=ticket_url or None,
+                )
 
         finally:
             self._in_session = False
@@ -1421,17 +1566,94 @@ class PhotoboothApp:
                 center=True, glow_px=10, glow_layers=7,
                 alpha_max=int(200 * fade),
             )
-        sub = f"{self._credits_prev} PHOTOS"
         draw_glow_text(
-            self.screen, sub, self.font_med,
+            self.screen, "MERCI", self.font_med,
             (self.w // 2, int(self.h * 0.58)),
             Y2K["text"], Y2K["accent_cyan"],
             center=True, glow_px=5, glow_layers=4,
             alpha_max=int(170 * fade),
         )
 
+    def _draw_print_offer_overlay(self) -> None:
+        """Post-capture screen — invites the user to pay to print, with the
+        remaining-time hint underneath. The user can tap the card (→ print) or
+        press the start button (→ cancel + new session)."""
+        if self._layout_print_offer is not None:
+            self._blit_layout(self._layout_print_offer)
+            # The layout image likely already carries the text, but we still
+            # show the seconds-remaining countdown over the top for clarity.
+            self._draw_offer_seconds_left()
+            return
+
+        # Dim backdrop over the live preview.
+        dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
+        dim.fill((0, 0, 0, 170))
+        self.screen.blit(dim, (0, 0))
+
+        # Big call-to-action.
+        main = self.cfg.print_offer_main_text
+        if main:
+            draw_glow_text(
+                self.screen, main, self.font_big,
+                (self.w // 2, int(self.h * 0.36)),
+                Y2K["text"], Y2K["accent_magenta"],
+                center=True, glow_px=10, glow_layers=7,
+            )
+
+        # Wrapped sub-line.
+        sub = self.cfg.print_offer_sub_text
+        if sub:
+            self._draw_wrapped_subline(sub, int(self.h * 0.56))
+
+        self._draw_offer_seconds_left()
+
+    def _draw_wrapped_subline(self, text: str, y: int) -> None:
+        """Wrap text to fit within ~80% screen width. Cheap word-wrap, fine
+        for the few-words French line we show under the offer."""
+        if not text:
+            return
+        max_w = int(self.w * 0.82)
+        words = text.split()
+        lines: list[str] = []
+        line  = ""
+        for w in words:
+            trial = (line + " " + w).strip()
+            if self.font_med.size(trial)[0] <= max_w:
+                line = trial
+            else:
+                if line:
+                    lines.append(line)
+                line = w
+        if line:
+            lines.append(line)
+        line_h = self.font_med.get_linesize()
+        total_h = line_h * len(lines)
+        cur_y = y - total_h // 2 + line_h // 2
+        for ln in lines:
+            draw_glow_text(
+                self.screen, ln, self.font_med,
+                (self.w // 2, cur_y),
+                Y2K["text"], Y2K["accent_cyan"],
+                center=True, glow_px=5, glow_layers=4,
+            )
+            cur_y += line_h
+
+    def _draw_offer_seconds_left(self) -> None:
+        remaining = max(0, int(round(self._print_offer_until - time.time())))
+        if remaining <= 0:
+            return
+        label = f"{remaining}s"
+        draw_glow_text(
+            self.screen, label, self.font_small,
+            (self.w // 2, self.h - int(self.h * 0.06)),
+            Y2K["text"], Y2K["accent_lime"],
+            center=True, glow_px=3, glow_layers=3,
+        )
+
     def _draw_pay_overlay(self) -> None:
-        """Idle screen — Price.png full-bleed (or text fallback when image is missing)."""
+        """Legacy idle screen — Price.png full-bleed (or text fallback when
+        image is missing). Only shown when the pay-after-capture flow is
+        disabled (cfg.print_offer_seconds == 0)."""
         if self._layout_pay is not None:
             self._blit_layout(self._layout_pay)
             return
@@ -1536,18 +1758,14 @@ class PhotoboothApp:
                                Y2K["text"], Y2K["accent_cyan"],
                                center=True, glow_px=10, glow_layers=7)
 
-        # Detect 0→positive transition so we can show a brief "accepted" message.
-        with self._credits_lock:
-            credits_now = self._payment_credits[0]
-        if credits_now > self._credits_prev:
-            self._payment_accepted_until = time.time() + float(self.cfg.payment_accepted_seconds)
-        self._credits_prev = credits_now
-
         # Overlays suppressed during an active session (countdown, capture, between-shot display).
         if countdown is None and not self._in_session:
             if time.time() < self._payment_accepted_until:
                 self._draw_payment_accepted()
-            elif credits_now == 0:
+            elif self._awaiting_payment:
+                self._draw_print_offer_overlay()
+            elif float(self.cfg.print_offer_seconds) <= 0:
+                # Legacy mode only: show the "please pay first" idle screen.
                 self._draw_pay_overlay()
 
         # Layout overlay (between content and post-effects, so scanlines stay on top).
@@ -1568,9 +1786,11 @@ class PhotoboothApp:
                     if event.key in (pygame.K_ESCAPE, pygame.K_q):
                         self.running = False
                     elif event.key == pygame.K_SPACE:
-                        if self._consume_credit():
-                            self._start_photo_sequence(
-                                MidiEvent(type="manual", raw={"type": "manual"}))
+                        if self._awaiting_payment:
+                            self._cancel_print_offer(reason="user pressed SPACE")
+                        self._discard_pending()
+                        self._start_photo_sequence(
+                            MidiEvent(type="manual", raw={"type": "manual"}))
                     elif event.key == pygame.K_f:
                         self.cycle_filter()
                     elif event.key == pygame.K_p:
@@ -1581,6 +1801,8 @@ class PhotoboothApp:
                     self.handle_midi_event(self.midi_queue.get_nowait())
             except queue.Empty:
                 pass
+
+            self._tick_print_offer()
 
             self._draw_frame()
             pygame.display.flip()
