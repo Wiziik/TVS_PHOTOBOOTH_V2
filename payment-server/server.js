@@ -286,7 +286,10 @@ async function runLoop() {
     }
 
     if (running) {
-      await sleep(300);
+      // After a SUCCESSFUL payment the Solo needs ~1s to finalise before it
+      // will accept the next checkout — re-arming too fast returns READER_BUSY
+      // and leaves the reader unarmed during the 2s retry backoff.
+      await sleep(paidTx ? 1500 : 300);
       log("info", `Cycle done (total paid: ${state.cycles}) — arming reader again`);
     }
   }
