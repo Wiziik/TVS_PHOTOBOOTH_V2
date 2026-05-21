@@ -29,11 +29,19 @@ between_shots_seconds = 2.5
 ready_text = PRÊT
 ; Pay-after-capture flow: after the photos are taken, an offer screen invites
 ; the user to pay for a printed copy. Set print_offer_seconds = 0 to disable
-; (the booth auto-prints every session as before).
-print_offer_seconds = 120
+; (the booth auto-prints every session as before). Keep this >= the SumUp
+; reader's ~65 s on-device timeout: one checkout is pushed when the window opens
+; and is never re-armed, so a shorter window leaves the reader live after the
+; offer hides (a late tap would charge but not print).
+print_offer_seconds = 70
 print_offer_main_text = PAIE 2€ POUR IMPRIMER
-print_offer_sub_text = T'as 2 minutes pour imprimer ou appuie pour reprendre une photo
+print_offer_sub_text = T'as une minute pour imprimer ou appuie pour reprendre une photo
 print_offer_layout =
+; Drawn over the live preview when idle (no session, no payment offer, no countdown).
+idle_layout = ./Layout/Photomaton.png
+; Looping attract video for the idle screen. When set and decodable it replaces
+; idle_layout (plays full-screen). Leave empty to use the idle_layout PNG instead.
+idle_video = ./Layout/Photobooth Base Video attente.mp4
 ; URL where the photobooth asks the payment server to arm/cancel the SumUp reader.
 payment_server_url = http://127.0.0.1:3000
 

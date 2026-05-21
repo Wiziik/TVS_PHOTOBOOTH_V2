@@ -1,7 +1,11 @@
 # TVS Photobooth — SumUp Payment Daemon
 
-Keeps a SumUp card reader permanently armed. Each tap triggers the printer then
-immediately arms the reader again. Loops forever.
+On-demand SumUp card-reader daemon. The photobooth `POST`s `/arm` right after a
+customer takes a photo; the daemon pushes **exactly one** checkout to the reader
+and waits for that single checkout to resolve — a tap triggers the printer, and a
+decline / device timeout / `/cancel` just returns it to idle. It is **never**
+re-armed automatically, so an un-tapped offer leaves at most one abandoned
+payment in the SumUp app instead of a fresh one every ~65 s.
 
 ---
 
@@ -40,7 +44,8 @@ npm install
 npm start
 ```
 
-That's it. The daemon logs every state change and the reader is armed immediately.
+That's it. The daemon logs every state change and waits idle until the
+photobooth arms it (`POST /arm`) after a photo is taken.
 
 ---
 
@@ -107,7 +112,9 @@ GET http://localhost:3000/status
 }
 ```
 
-`status` values: `starting` → `waiting` (reader armed) → `paid` / `failed` → back to `starting`
+`status` values: `idle` → `starting` → `waiting` (reader armed) → `paid` /
+`failed` / `cancelled` → `idle`. One `/arm` runs through this once (no loop back
+to `starting`); the next `/arm` after the next photo starts a fresh checkout.
 
 ---
 

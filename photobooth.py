@@ -280,6 +280,12 @@ class AppConfig:
     pay_overlay_layout:        str          = "./Layout/Price.png"
     payment_accepted_layout:   str          = "./Layout/Merci.png"
     ready_layout:              str          = "./Layout/Tenezvousprets.png"
+    # Drawn over the live preview whenever the booth is idle (no session in
+    # progress, no payment offer, no countdown). Empty path = no overlay.
+    idle_layout:               str          = "./Layout/Photomaton.png"
+    # Looping attract video shown when idle. Takes precedence over idle_layout
+    # when set and decodable (full-screen, opaque). Empty path = use idle_layout.
+    idle_video:                str          = "./Layout/Photobooth Base Video attente.mp4"
     shot_splash_layouts:       Tuple[str,...] = ("./Layout/Photo_1.png",
                                                  "./Layout/Photo_2.png",
                                                  "./Layout/Photo_3.png")
@@ -298,9 +304,11 @@ class AppConfig:
     # server triggers the print, the user pressing the start button cancels the
     # offer and starts a fresh session, and the timeout sends the booth back to
     # idle. Set print_offer_seconds = 0 to disable the offer entirely (auto-print).
-    print_offer_seconds:      float        = 120.0
+    # Must stay >= the SumUp reader's ~65 s on-device timeout (one checkout per
+    # offer, never re-armed) so the reader isn't left live after the offer hides.
+    print_offer_seconds:      float        = 70.0
     print_offer_main_text:    str          = "PAIE 2€ POUR IMPRIMER"
-    print_offer_sub_text:     str          = "T'as 2 minutes pour imprimer ou appuie pour reprendre une photo"
+    print_offer_sub_text:     str          = "T'as une minute pour imprimer ou appuie pour reprendre une photo"
     print_offer_layout:       str          = ""   # optional full-bleed PNG; empty = text overlay
     payment_server_url:       str          = "http://127.0.0.1:3000"
     # Web upload (QR landing page + email delivery)
@@ -353,10 +361,13 @@ between_shots_seconds = 2.5
 ready_text = PRÊT
 ; Pay-after-capture flow: after the photos are taken, an offer screen invites
 ; the user to pay for a printed copy. Set print_offer_seconds = 0 to disable
-; (the booth auto-prints every session as before).
-print_offer_seconds = 120
-print_offer_main_text = PAIE 2€ POUR IMPRIMER
-print_offer_sub_text = T'as 2 minutes pour imprimer ou appuie pour reprendre une photo
+; (the booth auto-prints every session as before). Keep this >= the SumUp
+; reader's ~65 s on-device timeout: one checkout is pushed when the window opens
+; and is never re-armed, so a shorter window leaves the reader live after the
+; offer hides (a late tap would charge but not print).
+print_offer_seconds = 70
+print_offer_main_text = PAIE 1€ POUR IMPRIMER
+print_offer_sub_text = T'as une minute pour imprimer ou appuie pour reprendre une photo
 print_offer_layout =
 ; URL where the photobooth asks the payment server to arm/cancel the SumUp reader.
 payment_server_url = http://127.0.0.1:3000
@@ -365,6 +376,11 @@ payment_server_url = http://127.0.0.1:3000
 pay_overlay_layout = ./Layout/Price.png
 payment_accepted_layout = ./Layout/Merci.png
 ready_layout = ./Layout/Tenezvousprets.png
+; Drawn over the live preview when idle (no session, no payment offer, no countdown).
+idle_layout = ./Layout/Photomaton.png
+; Looping attract video for the idle screen. When set and decodable it replaces
+; idle_layout (plays full-screen). Leave empty to use the idle_layout PNG instead.
+idle_video = ./Layout/Photobooth Base Video attente.mp4
 ; Per-shot splash images, comma-separated. Index N = shot N (1-based).
 shot_splash_layouts = ./Layout/Photo_1.png,./Layout/Photo_2.png,./Layout/Photo_3.png
 ; How long each PhotoN.png splash is shown before that shot's countdown begins.
@@ -485,6 +501,8 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         pay_overlay_layout       = str(app.get("pay_overlay_layout", "./Layout/Price.png")).strip(),
         payment_accepted_layout  = str(app.get("payment_accepted_layout", "./Layout/Merci.png")).strip(),
         ready_layout             = str(app.get("ready_layout", "./Layout/Tenezvousprets.png")).strip(),
+        idle_layout              = str(app.get("idle_layout", "./Layout/Photomaton.png")).strip(),
+        idle_video               = str(app.get("idle_video", "./Layout/Photobooth Base Video attente.mp4")).strip(),
         shot_splash_layouts      = tuple(
             x.strip() for x in str(app.get(
                 "shot_splash_layouts",
@@ -501,11 +519,11 @@ def load_config(path: Path = DEFAULT_INI_PATH) -> AppConfig:
         credits_per_unlock       = max(1, _int(app.get("credits_per_unlock"), 1)),
         photos_per_session       = max(1, _int(app.get("photos_per_session"), 3)),
         between_shots_seconds    = max(0.0, _float(app.get("between_shots_seconds"), 2.5)),
-        print_offer_seconds      = max(0.0, _float(app.get("print_offer_seconds"), 120.0)),
+        print_offer_seconds      = max(0.0, _float(app.get("print_offer_seconds"), 70.0)),
         print_offer_main_text    = str(app.get("print_offer_main_text",
                                                "PAIE 2€ POUR IMPRIMER")).strip(),
         print_offer_sub_text     = str(app.get("print_offer_sub_text",
-                                               "T'as 2 minutes pour imprimer ou appuie pour reprendre une photo")).strip(),
+                                               "T'as une minute pour imprimer ou appuie pour reprendre une photo")).strip(),
         print_offer_layout       = str(app.get("print_offer_layout", "")).strip(),
         payment_server_url       = str(app.get("payment_server_url", "http://127.0.0.1:3000")).strip(),
         upload_url               = str(web.get("upload_url", "")).strip(),
@@ -652,6 +670,14 @@ class CameraController:
                     continue
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH,  self.cfg.opencv_width)
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.cfg.opencv_height)
+                # Ask V4L2 for the shallowest possible queue so reads return
+                # the freshest frame instead of an oldest-first FIFO. Some
+                # USB capture cards ignore this; the capture-time drain below
+                # is the belt-and-suspenders fix.
+                try:
+                    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                except Exception:
+                    pass
                 ok, _ = cap.read()
                 if ok:
                     self._opencv_cap = cap
@@ -731,6 +757,20 @@ class CameraController:
         except Exception:
             return None
 
+    def _drain_opencv_buffer(self, max_frames: int = 8) -> None:
+        """Flush stale frames from the V4L2 queue so the next read returns the
+        live moment. During the countdown sleeps we read the preview at 1 Hz
+        while the camera produces frames at 30 Hz, so the kernel queue ends up
+        full of stale frames — the next read would return one of those (the
+        capture would look like the moment '3' appeared on screen, not the
+        moment of the flash). Cheap to call: grab() just discards a frame
+        without decoding it."""
+        if self.backend != "opencv" or self._opencv_cap is None:
+            return
+        for _ in range(max_frames):
+            if not self._opencv_cap.grab():
+                return
+
     def capture_still(self) -> Optional[Image.Image]:
         try:
             if self.backend == "picamera2" and self._picam2:
@@ -745,6 +785,7 @@ class CameraController:
                 self._picam2.start()
                 return Image.fromarray(arr)
             if self.backend == "opencv" and self._opencv_cap is not None:
+                self._drain_opencv_buffer()
                 arr = self.get_preview_frame()
                 return Image.fromarray(arr, mode="RGB") if arr is not None else None
             if self.backend == "mock":
@@ -782,6 +823,7 @@ class CameraController:
                 self.backend = "none"
                 return Image.fromarray(arr)
             if self.backend == "opencv" and self._opencv_cap is not None:
+                self._drain_opencv_buffer()
                 arr = self.get_preview_frame()
                 try:
                     self._opencv_cap.release()
@@ -965,6 +1007,89 @@ def start_unlock_server(on_payment, midi_queue: "queue.Queue") -> None:
 
 
 # ---------------------------------------------------------------------------
+# Idle attract video
+# ---------------------------------------------------------------------------
+
+class IdleVideo:
+    """Looping full-screen attract clip for the idle screen, decoded with
+    OpenCV and converted to pygame surfaces on demand. Paces itself to the
+    clip's native frame rate using wall-clock time, so it never accumulates a
+    backlog if the UI loop runs slower than the video. Degrades to None when
+    the file is missing or OpenCV can't open it, letting callers fall back to
+    the static idle layout PNG."""
+
+    def __init__(self, path: str, size: Tuple[int, int]) -> None:
+        self.size = size                 # (w, h) target screen size
+        self.cap = None
+        self._surface: Optional[pygame.Surface] = None
+        self._interval = 1.0 / 25.0
+        self._next_due = 0.0
+        if not path:
+            return
+        try:
+            import cv2  # type: ignore
+            p = Path(path).expanduser()
+            if not p.is_absolute():
+                p = (Path(__file__).resolve().parent / p).resolve()
+            if not p.exists():
+                logging.warning("Idle video not found: %s", p)
+                return
+            cap = cv2.VideoCapture(str(p))
+            if not cap.isOpened():
+                logging.warning("Could not open idle video: %s", p)
+                cap.release()
+                return
+            self.cap = cap
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            if fps and fps > 1.0:
+                self._interval = 1.0 / fps
+            logging.info("Idle video loaded: %s (%.1f fps)", p, fps or 25.0)
+        except Exception:
+            logging.exception("Failed to load idle video: %s", path)
+            self.cap = None
+
+    def available(self) -> bool:
+        return self.cap is not None
+
+    def _to_surface(self, frame) -> pygame.Surface:
+        import cv2  # type: ignore
+        if (frame.shape[1], frame.shape[0]) != self.size:
+            frame = cv2.resize(frame, self.size, interpolation=cv2.INTER_AREA)
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        return pygame.image.frombuffer(frame.tobytes(), self.size, "RGB")
+
+    def get_surface(self) -> Optional[pygame.Surface]:
+        """Return the current frame, advancing to the next one at the clip's
+        native rate and looping back to the start at the end."""
+        if self.cap is None:
+            return None
+        now = time.time()
+        if self._surface is None or now >= self._next_due:
+            import cv2  # type: ignore
+            ok, frame = self.cap.read()
+            if not ok:  # end of clip -> loop
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                ok, frame = self.cap.read()
+            if ok:
+                try:
+                    self._surface = self._to_surface(frame)
+                except Exception:
+                    logging.exception("Idle video frame conversion failed")
+                    self.cap = None
+                    return None
+            self._next_due = now + self._interval
+        return self._surface
+
+    def close(self) -> None:
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -996,7 +1121,7 @@ class PhotoboothApp:
         # awaiting payment, fires the print and returns to idle.
         #
         # `_pending_print_paths` outlives `_awaiting_payment` by `_pending_grace_seconds`
-        # so a card tap arriving just after the photobooth's 120 s window
+        # so a card tap arriving just after the photobooth's print-offer window
         # (the payment server's poll might still return SUCCESSFUL after we
         # already fired /cancel) still results in a printed strip rather
         # than a paid-but-not-printed customer.
@@ -1105,11 +1230,14 @@ class PhotoboothApp:
             except Exception:
                 logging.exception("Failed to load pay_overlay_image")
 
-        # Full-bleed layout images (Price/Merci/Tenez_vous_prets/Photo1-3 + optional print-offer).
+        # Full-bleed layout images (Price/Merci/Tenez_vous_prets/Photo1-3 + optional print-offer + idle).
         self._layout_pay          = self._load_layout_image(cfg.pay_overlay_layout)
         self._layout_accepted     = self._load_layout_image(cfg.payment_accepted_layout)
         self._layout_ready        = self._load_layout_image(cfg.ready_layout)
         self._layout_print_offer  = self._load_layout_image(cfg.print_offer_layout)
+        self._layout_idle         = self._load_layout_image(cfg.idle_layout)
+        # Looping attract video for the idle screen; falls back to _layout_idle.
+        self._idle_video          = IdleVideo(cfg.idle_video, (self.w, self.h))
         self._layout_shots: list[Optional[pygame.Surface]] = [
             self._load_layout_image(p) for p in cfg.shot_splash_layouts
         ]
@@ -1152,6 +1280,8 @@ class PhotoboothApp:
         except Exception: pass
         try: self.web_uploader.stop()
         except Exception: pass
+        try: self._idle_video.close()
+        except Exception: pass
         pygame.quit()
 
     # ---- pay-after-capture flow ----
@@ -1182,7 +1312,9 @@ class PhotoboothApp:
 
     def _enter_print_offer(self, photo_paths: list, qr_url: Optional[str]) -> None:
         """Transition to the AWAITING_PAYMENT state: store the session for later
-        printing, arm the SumUp reader, start the offer timer, set the overlay."""
+        printing, arm the SumUp reader, start the offer timer, set the overlay.
+        Extends last_photo_shown_until so the captured photo stays full-screen
+        as the offer background — the customer needs to see what they'd print."""
         self._pending_print_paths = list(photo_paths)
         self._pending_qr_url      = qr_url
         self._print_offer_until   = time.time() + float(self.cfg.print_offer_seconds)
@@ -1191,6 +1323,8 @@ class PhotoboothApp:
         self._payment_event.clear()
         # Hide any leftover status line from the capture sequence.
         self.status_until = 0.0
+        # Keep the photo visible underneath the offer overlay.
+        self.last_photo_shown_until = self._print_offer_until
         self._post_payment_server("/arm")
         logging.info("Print offer started — %d photo(s) pending, timeout in %.0fs",
                      len(self._pending_print_paths), self.cfg.print_offer_seconds)
@@ -1216,6 +1350,8 @@ class PhotoboothApp:
         self._post_payment_server("/cancel")
         self._awaiting_payment   = False
         self._print_offer_until  = 0.0
+        # Stop holding the photo on screen — the offer is over.
+        self.last_photo_shown_until = 0.0
         # Keep _pending_print_paths / _pending_expire_at — race window.
 
     def _fire_pending_print(self) -> None:
@@ -1229,6 +1365,9 @@ class PhotoboothApp:
             return
         # Flash Merci.png briefly, same as the old credit-based flow did.
         self._payment_accepted_until = time.time() + float(self.cfg.payment_accepted_seconds)
+        # Drop the extended photo-display window now that the print is firing —
+        # the booth will return to live preview shortly after the Merci flash.
+        self.last_photo_shown_until = time.time() + float(self.cfg.payment_accepted_seconds) + 2.0
         self.camera.close()  # free USB bandwidth for the printer
         self.set_status("Printing…", 120.0)
         self.printer.print_async(
@@ -1239,8 +1378,8 @@ class PhotoboothApp:
 
     def _tick_print_offer(self) -> None:
         """Called once per main-loop iteration. Drives the AWAITING_PAYMENT
-        state forward: prints if payment arrived, cancels at the 120 s window,
-        discards stale pending paths after the grace window."""
+        state forward: prints if payment arrived, cancels when the print-offer
+        window elapses, discards stale pending paths after the grace window."""
         # A late /unlock — print even if we already cancelled, as long as we
         # still have the paths in the grace window.
         if self._payment_event.is_set():
@@ -1575,36 +1714,38 @@ class PhotoboothApp:
         )
 
     def _draw_print_offer_overlay(self) -> None:
-        """Post-capture screen — invites the user to pay to print, with the
-        remaining-time hint underneath. The user can tap the card (→ print) or
-        press the start button (→ cancel + new session)."""
+        """Post-capture screen — the captured photo fills the screen (it's
+        drawn underneath via _draw_frame's last_photo path), and this method
+        adds dimmed top/bottom strips with the call-to-action and the
+        French sub-line so the photo stays the visual focus."""
         if self._layout_print_offer is not None:
             self._blit_layout(self._layout_print_offer)
-            # The layout image likely already carries the text, but we still
-            # show the seconds-remaining countdown over the top for clarity.
             self._draw_offer_seconds_left()
             return
 
-        # Dim backdrop over the live preview.
-        dim = pygame.Surface((self.w, self.h), pygame.SRCALPHA)
-        dim.fill((0, 0, 0, 170))
-        self.screen.blit(dim, (0, 0))
-
-        # Big call-to-action.
         main = self.cfg.print_offer_main_text
+        sub  = self.cfg.print_offer_sub_text
+
+        # ── Top strip with the price call-to-action ─────────────────────────
         if main:
+            strip_h = int(self.h * 0.18)
+            strip   = pygame.Surface((self.w, strip_h), pygame.SRCALPHA)
+            strip.fill((0, 0, 0, 180))
+            self.screen.blit(strip, (0, 0))
             draw_glow_text(
                 self.screen, main, self.font_big,
-                (self.w // 2, int(self.h * 0.36)),
+                (self.w // 2, strip_h // 2),
                 Y2K["text"], Y2K["accent_magenta"],
                 center=True, glow_px=10, glow_layers=7,
             )
 
-        # Wrapped sub-line.
-        sub = self.cfg.print_offer_sub_text
+        # ── Bottom strip with the wrapped sub-line + seconds-remaining ──────
+        bot_h = int(self.h * 0.22)
+        bot   = pygame.Surface((self.w, bot_h), pygame.SRCALPHA)
+        bot.fill((0, 0, 0, 180))
+        self.screen.blit(bot, (0, self.h - bot_h))
         if sub:
-            self._draw_wrapped_subline(sub, int(self.h * 0.56))
-
+            self._draw_wrapped_subline(sub, self.h - int(bot_h * 0.62))
         self._draw_offer_seconds_left()
 
     def _draw_wrapped_subline(self, text: str, y: int) -> None:
@@ -1767,6 +1908,18 @@ class PhotoboothApp:
             elif float(self.cfg.print_offer_seconds) <= 0:
                 # Legacy mode only: show the "please pay first" idle screen.
                 self._draw_pay_overlay()
+            elif showing_last_photo:
+                # Holding the just-taken photo briefly — no overlay so the
+                # customer sees what was captured.
+                pass
+            else:
+                # Truly idle: full-screen attract video if available, otherwise
+                # the call-to-action PNG overlay over the live preview.
+                vsurf = self._idle_video.get_surface() if self._idle_video.available() else None
+                if vsurf is not None:
+                    self.screen.blit(vsurf, (0, 0))
+                elif self._layout_idle is not None:
+                    self._blit_layout(self._layout_idle)
 
         # Layout overlay (between content and post-effects, so scanlines stay on top).
         if layout_overlay is not None:

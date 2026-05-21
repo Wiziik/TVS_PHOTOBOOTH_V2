@@ -4,7 +4,7 @@
 
 BRAND_TOP = LE ROOFTOP
 BRAND_SUB = MARSEILLE
-BRAND_HANDLES = @tvstore x @lerooftopmarseille
+BRAND_HANDLES = @tvstore.fr x @lerooftopmarseille
 FOOTER_1 = tvstore.fr
 FOOTER_2 = Merci - Keep the signal alive
 QR_URL = https://tvstore.fr

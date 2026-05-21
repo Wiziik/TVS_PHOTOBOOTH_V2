@@ -267,6 +267,7 @@ def print_receipt(
         p.set(align="center", text_type="normal", width=1, height=1)
         p.text(text_cfg["BRAND_SUB"] + "\n")
         if text_cfg.get("BRAND_HANDLES"):
+            p.text("\n")        # blank line between venue name and handles
             p.text(text_cfg["BRAND_HANDLES"] + "\n")
         p.text("-" * 32 + "\n")
 

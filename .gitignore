@@ -25,3 +25,7 @@ venv/
 # Node
 payment-server/node_modules/
 web-server/node_modules/
+
+# Large media — kept local only (exceeds GitHub's 100 MB limit; the app falls
+# back to the idle_layout PNG when the attract video is absent).
+*.mp4
